@@ -44,7 +44,7 @@ ChapterPlayer tracks the ChapterScript format package at `main` while the wire f
 MIT means a visible credit is never required beyond the license notice itself.
 That said, if your app ships with ChapterPlayer inside, a mention is
 appreciated, and we'd genuinely love to hear what you made:
-[hello@chapterscript.com](mailto:hello@chapterscript.com).
+[maestro@stepinto.vision](mailto:maestro@stepinto.vision).
 
 ## License
 
