@@ -1,6 +1,6 @@
 # ChapterPlayer
 
-The open source visionOS runtime that plays [ChapterScript](https://github.com/mike-bundy/ChapterScript) documents. It bundles the sequence engine, spatial audio and video managers, entity factory, gate detection, and live-development client into a single Swift package, so a consuming app only needs to ship its UI, content, and product-specific extensions.
+The open source visionOS runtime that plays [ChapterScript](https://github.com/StepIntoVision/ChapterScript) documents. It bundles the sequence engine, spatial audio and video managers, entity factory, gate detection, and live-development client into a single Swift package, so a consuming app only needs to ship its UI, content, and product-specific extensions.
 
 ChapterPlayer is the same runtime that powers playback in [Maestro](https://maestrostud.io), the commercial authoring suite. Website: [chapterscript.com](https://chapterscript.com).
 
@@ -28,7 +28,7 @@ ChapterPlayer is the same runtime that powers playback in [Maestro](https://maes
 `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/mike-bundy/ChapterPlayer.git", branch: "main")
+.package(url: "https://github.com/StepIntoVision/ChapterPlayer.git", branch: "main")
 ```
 
 ChapterPlayer tracks the ChapterScript format package at `main` while the wire format is pre-1.0; both will pin to tagged versions once the format settles. A local sibling checkout of `ChapterScript` overrides the remote by package identity (the standard local-override workflow).
@@ -37,7 +37,7 @@ ChapterPlayer tracks the ChapterScript format package at `main` while the wire f
 
 - visionOS 26+
 - Swift 6.2 / Xcode 26+
-- [ChapterScript](https://github.com/mike-bundy/ChapterScript) (resolved automatically)
+- [ChapterScript](https://github.com/StepIntoVision/ChapterScript) (resolved automatically)
 
 ## Credits
 

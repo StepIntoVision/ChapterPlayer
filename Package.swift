@@ -19,7 +19,7 @@ let package = Package(
         // ../ChapterScript package reference OVERRIDES this remote by
         // package identity — the standard local-override workflow. Pin to
         // a tagged version once the format settles.
-        .package(url: "https://github.com/mike-bundy/ChapterScript.git", branch: "main")
+        .package(url: "https://github.com/StepIntoVision/ChapterScript.git", branch: "main")
     ],
     targets: [
         .target(
