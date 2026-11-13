@@ -3,10 +3,13 @@
 //  ChapterPlayer
 //
 //  THE MIRROR of `MaestroKit.BevelProfileCatalog` (FL-07 / FL-22). The
-//  editors and the player cannot share code, so the table and the rule are
-//  duplicated verbatim and held together by MaestroVision's
-//  `BevelProfileSeamTests`: a profile is a named chamfer resolution; an id
-//  this build does not know draws NO bevel and keeps the reference.
+//  editors and the player cannot share code, so the ids, segment counts and
+//  rule are duplicated (the Kit catalog also carries display names) and held
+//  together by `TitleSeamTests.testBevelProfilesBuildIdentically` in
+//  MaestroVisionTests: a profile is a named chamfer resolution; an id this
+//  build does not know draws NO bevel and keeps the reference. That test
+//  builds Chamfer, Soft and an unknown id on both sides; it does not compare
+//  the two tables entry by entry.
 //
 
 import Foundation

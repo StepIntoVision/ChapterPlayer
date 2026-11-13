@@ -8,13 +8,14 @@
 //
 //  Conventions
 //  -----------
-//  - `t` is normalized segment progress, clamped to [0, 1].
+//  - `t` is the motion's own normalized progress (from its start on the
+//    authored clock, `MotionProgress.progress`), clamped to [0, 1].
 //  - `absoluteTime` is seconds since sequence start; `oscillate` and `rotate`
 //    use it where they need real-time-locked behavior.
 //  - `oscillate.frequency` is in Hz (cycles per second of absoluteTime).
 //  - `rotate(axis, revolutions)` returns axis * angleInRadians where
 //    angle = revolutions * 2π * t — i.e. the rotation completes `revolutions`
-//    full turns over the segment. Position-channel applies treat the result as
+//    full turns over the motion. Position-channel applies treat the result as
 //    a position offset (rarely useful); rotation-channel applies treat the
 //    Vec3 as an axis-angle vector.
 //
@@ -25,7 +26,7 @@ import ChapterScript
 
 public enum MotionCurveEvaluator {
 
-    /// Evaluate `curve` at normalized segment progress `t` and seconds-since-start `absoluteTime`.
+    /// Evaluate `curve` at the motion's normalized progress `t` and seconds-since-start `absoluteTime`.
     /// Returns a `SIMD3<Float>` ready for direct assignment to entity transforms.
     ///
     /// Thin wrapper over `ChapterScript.MotionCurveSampling` — the ONE

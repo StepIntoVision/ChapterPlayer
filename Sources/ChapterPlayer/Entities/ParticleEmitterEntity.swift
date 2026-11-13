@@ -6,12 +6,18 @@
 //  definition carries only a `particlePresetId`; the document's
 //  `particlePresets` array holds the full-fidelity `ParticleEmitterPreset`
 //  (ChapterScript) that the editors author. This file maps that format
-//  preset onto RealityKit's `ParticleEmitterComponent` the same way
-//  Maestro's Afterburn viewport does (`ParticleEmitterComponent.create(from:)`
-//  on the Mac), so authored values look the same in the player.
+//  preset onto RealityKit's `ParticleEmitterComponent`, mirroring Maestro's
+//  Afterburn viewport on the Mac (`ParticleEmitterComponent.create(from:)` in
+//  the app's `Shared/Afterburn`, which maps the Mac's `EmitterSettings`, not
+//  this preset). The two are separate copies kept equal by hand, not one
+//  shared function: until the 2026-11-13 fix pass the Mac skipped lighting,
+//  sort order and the torus inner radius (ARC-11), so check both when either
+//  changes.
 //
-//  The mapping is a pure function (`ParticleEmitterComponent(preset:)`) so
-//  editors can reuse it; only texture loading is async. Particle images
+//  The mapping is a pure function (`ParticleEmitterComponent(preset:)`), so
+//  MaestroVision reuses it directly (its particle editor); the Mac cannot,
+//  because ChapterPlayer builds only for visionOS. Only texture loading is
+//  async. Particle images
 //  ("default" soft sprite or SF Symbol names) resolve through
 //  `ParticleTextureCache` and are applied to the entity's component when
 //  they land — the emitter renders untextured in the meantime.

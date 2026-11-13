@@ -12,9 +12,15 @@
 
 import Foundation
 import CoreText
+import OSLog
 import RealityKit
 import UIKit
 import ChapterScript
+
+private let titleMeshLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "com.shellcorp.chapterplayer",
+    category: "TitleMesh"
+)
 
 public enum TitleMesh {
 
@@ -46,12 +52,18 @@ public enum TitleMesh {
         /// with the anchor already applied. `mesh` is flat (see `realize`),
         /// so anything that needs to find a glyph reads this.
         public let contents: MeshResource.Contents
+        /// True when NO bevel was drawn because this exact geometry was being
+        /// built when the process last died inside RealityKit's chamfer
+        /// evaluator. See `TitleMesh.CrashGuard`.
+        public let bevelSkippedAfterCrash: Bool
 
         public init(mesh: MeshResource, materials: [any Material],
-                    contents: MeshResource.Contents? = nil) {
+                    contents: MeshResource.Contents? = nil,
+                    bevelSkippedAfterCrash: Bool = false) {
             self.mesh = mesh
             self.materials = materials
             self.contents = contents ?? mesh.contents
+            self.bevelSkippedAfterCrash = bevelSkippedAfterCrash
         }
     }
 
@@ -74,7 +86,7 @@ public enum TitleMesh {
     /// Cap-height-meters font resolution — the mirror of
     /// `MaestroKit.FontResolution.resolve`.
     static func resolveFont(family: String?, weight: Int?, italic: Bool?,
-                            capHeightMetres: Float, sourceURL: URL? = nil) -> CTFont {
+                            capHeightMeters: Float, sourceURL: URL? = nil) -> CTFont {
         let probeSize: CGFloat = 100
         let base: CTFont
         if let sourceURL, let fromFile = fontFromFile(sourceURL, size: probeSize) {
@@ -99,7 +111,7 @@ public enum TitleMesh {
                 ?? CTFontCreateWithName("Helvetica" as CFString, probeSize, nil)
         }
         let capAtProbe = CTFontGetCapHeight(base)
-        let meters = CGFloat(max(capHeightMetres, 0.0001))
+        let meters = CGFloat(max(capHeightMeters, 0.0001))
         let pointSize = capAtProbe > 0 ? meters * probeSize / capAtProbe : meters
         return CTFontCreateCopyWithAttributes(base, pointSize, nil, nil)
     }
@@ -150,7 +162,7 @@ public enum TitleMesh {
     static func sizedFont(for spec: TextSpec, fontURL: URL? = nil) -> CTFont {
         let baseFont = resolveFont(family: spec.fontFamily, weight: spec.fontWeight,
                                    italic: spec.fontIsItalic,
-                                   capHeightMetres: spec.fontSize,
+                                   capHeightMeters: spec.fontSize,
                                    sourceURL: fontURL)
         let capRatio = CTFontGetCapHeight(baseFont) / max(CTFontGetSize(baseFont), 0.0001)
         let targetCapPoints = CGFloat(max(spec.fontSize, 0.0001)) / unitsPerPoint()
@@ -265,7 +277,18 @@ public enum TitleMesh {
         // The mirrored profile rule: an unknown id draws NO bevel.
         let profile = BevelProfiles.resolve(profileId: spec.bevelProfileId,
                                             segments: spec.bevelSegments)
-        if let radius = spec.bevelRadius, radius > 0, profile != .unresolved {
+        // THE BACKSTOP, mirrored from the Mac (see `CrashGuard`): this exact
+        // geometry was being built when the process last died, so it is
+        // built again WITHOUT the chamfer that killed it rather than a second
+        // time. Only a chamfered build is ever recorded.
+        let guardKey = (spec.bevelRadius ?? 0) > 0 && profile != .unresolved
+            ? geometryKey(spec: spec, fontURL: fontURL, styleRuns: styleRuns)
+            : nil
+        let bevelSkippedAfterCrash = guardKey.map { CrashGuard.hasCrashedBefore(key: $0) } ?? false
+        if bevelSkippedAfterCrash {
+            titleMeshLogger.warning("[title] '\(spec.text, privacy: .private)' is drawn without its bevel: building it last time never returned")
+        }
+        if let radius = spec.bevelRadius, radius > 0, profile != .unresolved, !bevelSkippedAfterCrash {
             extrusion.chamferRadius = min(radius, bevelCeiling(depth: depth,
                                                               fontSize: spec.fontSize))
                 / max(unit, 1e-9)
@@ -285,9 +308,18 @@ public enum TitleMesh {
             slotCount = 5
         }
 
-        let laidOut = try MeshResource(extruding: attributed,
+        // The key goes to disk BEFORE the extruder is entered and comes off
+        // it when the extruder returns or throws: a record that outlives the
+        // call is a build that never came back.
+        let recordsBuild = guardKey != nil && !bevelSkippedAfterCrash
+        let laidOut: MeshResource
+        do {
+            if recordsBuild, let guardKey { CrashGuard.markInFlight(key: guardKey) }
+            defer { if recordsBuild, let guardKey { CrashGuard.clearInFlight(key: guardKey) } }
+            laidOut = try MeshResource(extruding: attributed,
                                        textOptions: textOptions,
                                        extrusionOptions: extrusion)
+        }
         // A WRAPPED block comes down from the container's top to where a
         // frameless line sits — the editors' wrapped-layout rule.
         let frameShift = -Float(framedLayoutShiftPoints(attributed: attributed,
@@ -304,7 +336,8 @@ public enum TitleMesh {
         let mesh = simd_length(shift) > 1e-7 ? try realize(contents) : laidOut
         return Result(mesh: mesh,
                       materials: materials(for: spec, slotCount: slotCount),
-                      contents: contents)
+                      contents: contents,
+                      bevelSkippedAfterCrash: bevelSkippedAfterCrash)
     }
 
     /// Mirror of `MaestroKit.TitleGeometryContract.anchorOffsetY`.
@@ -463,6 +496,94 @@ public enum TitleMesh {
 }
 
 extension TitleMesh {
+    /// THE BACKSTOP FOR AN ABORT NOTHING CAN CATCH: the mirror of
+    /// `MaestroKit.TitleGeometryCrashGuard`.
+    ///
+    /// `bevelCeiling` keeps a chamfer below every threshold measured, but it
+    /// is a MEASURED constant and a face nobody measured can be thinner. When
+    /// the chamfer's straight skeleton collapses, RealityKit aborts the
+    /// process from C++, and `try?` at the call site does not help. So:
+    ///
+    ///   - before a chamfered build, the geometry key is written to disk;
+    ///   - when the build returns (or throws), the key is removed;
+    ///   - a key found ALREADY on disk belongs to a build that never
+    ///     returned, so that exact geometry is built with NO chamfer, and
+    ///     `Result.bevelSkippedAfterCrash` says so.
+    ///
+    /// A false positive (the app was killed mid-build) costs one Title drawn
+    /// without its bevel until any field of its geometry changes. Its own
+    /// defaults key, apart from the editor's: the two builders key their
+    /// geometry differently.
+    @MainActor
+    public enum CrashGuard {
+        /// Where the in-flight keys live. Replaceable so a test can use its
+        /// own suite.
+        public static var store: UserDefaults = .standard
+
+        static let defaultsKey = "ChapterPlayer.TitleMesh.inFlightChamferBuilds"
+
+        /// Only builds that never returned stay listed, so the list is short.
+        private static let limit = 32
+
+        static func recorded() -> [String] {
+            store.stringArray(forKey: defaultsKey) ?? []
+        }
+
+        /// True when a previous run of this EXACT geometry never completed.
+        public static func hasCrashedBefore(key: String) -> Bool {
+            recorded().contains(key)
+        }
+
+        /// Write the key before entering the extruder, and flush: a record
+        /// still in memory when the process aborts records nothing.
+        public static func markInFlight(key: String) {
+            var keys = recorded()
+            guard !keys.contains(key) else { return }
+            keys.append(key)
+            if keys.count > limit { keys.removeFirst(keys.count - limit) }
+            store.set(keys, forKey: defaultsKey)
+            store.synchronize()
+        }
+
+        /// The build came back, so the key was never a crasher.
+        public static func clearInFlight(key: String) {
+            var keys = recorded()
+            guard let index = keys.firstIndex(of: key) else { return }
+            keys.remove(at: index)
+            store.set(keys, forKey: defaultsKey)
+        }
+
+        /// Forget every recorded crash, so every bevel is tried again.
+        public static func forgetAll() {
+            store.removeObject(forKey: defaultsKey)
+        }
+    }
+
+    /// Every field the extruder reads, so a key names one exact geometry:
+    /// the mirror of `MaestroKit.TitleGeometry.cacheKey`, without the tier
+    /// the player does not have.
+    public static func geometryKey(spec: TextSpec, fontURL: URL? = nil,
+                                   styleRuns: [StyleRun] = []) -> String {
+        var parts: [String] = [
+            spec.fontSourceId ?? "", fontURL?.path ?? "",
+            spec.text, "\(spec.fontSize)",
+            spec.fontFamily ?? "", "\(spec.fontWeight ?? 400)",
+            "\(spec.fontIsItalic ?? false)",
+            "\(spec.tracking ?? .nan)", "\(spec.leading ?? .nan)",
+            spec.alignmentX?.rawValue ?? "", spec.alignmentY?.rawValue ?? "",
+            "\(spec.maxWidth ?? .nan)",
+            "\(spec.extrusionDepth ?? defaultExtrusionDepth)",
+            spec.capFill?.rawValue ?? "",
+            "\(spec.bevelRadius ?? 0)", spec.bevelProfileId ?? "",
+            "\(spec.bevelSegments ?? 0)",
+            "slots:\(spec.slotMaterials?.isEmpty == false)",
+        ]
+        for run in styleRuns {
+            parts.append("run:\(run.start):\(run.length):\(run.bold):\(run.italic)")
+        }
+        return parts.joined(separator: "|")
+    }
+
     /// Mirror of `MaestroKit.FontResolution.fontFromFile`.
     static func fontFromFile(_ url: URL, size: CGFloat) -> CTFont? {
         guard FileManager.default.fileExists(atPath: url.path),

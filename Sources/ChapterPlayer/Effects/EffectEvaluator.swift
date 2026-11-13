@@ -21,7 +21,8 @@ public struct EffectRenderEnvironment: Sendable {
     /// The MAPPED source time (a `.source` parameter's clock — FL-13's
     /// retime compensation arrives through this argument).
     public let sourceTime: Double
-    /// Bytes of a `.sourceReference` parameter's file (a LUT, a matte),
+    /// Bytes of a `.sourceReference` parameter's file (Color's LUT, the only
+    /// one; a matte is an `.occurrenceReference`, never a file),
     /// resolved by the host. Nil ⇒ the referencing stage bypasses and the
     /// Inspector reports; the reference itself is never dropped.
     public let sourceData: (@Sendable (String) -> Data?)?
@@ -127,7 +128,7 @@ public enum EffectEvaluator {
 
     /// The render plan: enabled, renderable Effects in authored order,
     /// grouped into contiguous runs by their color-values declaration.
-    /// Bypassed and unrecognised Effects appear in NO batch — excluded
+    /// Bypassed and unrecognized Effects appear in NO batch — excluded
     /// from the graph, not rendered at zero strength.
     public static func batches(for stack: [EffectInstance],
                                renderers: [String: EffectRenderer]? = nil) -> [Batch] {
@@ -158,10 +159,10 @@ public enum EffectEvaluator {
     // MARK: - Evaluation
 
     public struct Result {
-        public init(image: CIImage, renderedCount: Int, unrecognised: [String]) {
+        public init(image: CIImage, renderedCount: Int, unrecognized: [String]) {
             self.image = image
             self.renderedCount = renderedCount
-            self.unrecognised = unrecognised
+            self.unrecognized = unrecognized
         }
         public let image: CIImage
         /// How many Effects actually rendered — the bypass counter's
@@ -169,7 +170,7 @@ public enum EffectEvaluator {
         public let renderedCount: Int
         /// Ids this build could not render (kept in the stack, reported
         /// in the Inspector).
-        public let unrecognised: [String]
+        public let unrecognized: [String]
     }
 
     /// Evaluate one ordered stack over one premultiplied input image.
@@ -182,7 +183,7 @@ public enum EffectEvaluator {
                                 environment: EffectRenderEnvironment,
                                 renderers: [String: EffectRenderer]? = nil) -> Result {
         let known = renderers ?? builtInRenderers
-        let unrecognised = stack
+        let unrecognized = stack
             .filter { $0.enabled && known[$0.effectId] == nil }
             .map(\.effectId)
 
@@ -206,6 +207,6 @@ public enum EffectEvaluator {
             if batch.bracketed { image = image.premultiplyingAlpha() }
         }
         return Result(image: image, renderedCount: rendered,
-                      unrecognised: unrecognised)
+                      unrecognized: unrecognized)
     }
 }

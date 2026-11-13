@@ -197,7 +197,7 @@ public final class EntityFactory {
         // today's behavior. Naming a clip the file does not have plays
         // NOTHING - not every clip, which would be a surprising fallback.
         // THE SHARED STATIC: both editors reuse this, so the narrowing
-        // lands everywhere in lock-segment.
+        // lands everywhere at once.
         while let e = stack.popLast() {
             for animation in e.availableAnimations {
                 if let wanted = spec.clipName,

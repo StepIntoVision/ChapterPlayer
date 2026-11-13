@@ -22,8 +22,10 @@ public enum EffectParameterKind: String, Codable, Sendable, Equatable {
     case point           // normalized; the space is declared
     case boolean
     case choice          // a small enum
-    /// A Source the Effect reads (a LUT, a matte) — a FILE reference the
-    /// reference walks must see, or the Final Bundle deletes it.
+    /// A Source FILE the Effect reads (today only Color's LUT): a FILE
+    /// reference the reference walks must see, or the Final Bundle deletes
+    /// it. A matte is NOT one: `matteFromClip` names an occurrence
+    /// (`.occurrenceReference`, `EffectSourceReferences.occurrences(in:)`).
     case sourceReference
     /// An ordered monotone control-point curve (FL-10) — a structured
     /// value; between two curves with different point counts there is no
@@ -136,7 +138,7 @@ public struct EffectParameterSchema: Sendable, Equatable {
         case .choice:
             if let s = value.stringValue, !choices.isEmpty,
                !choices.contains(where: { $0.key == s }) {
-                // An unrecognised case renders as the default; stored
+                // An unrecognized case renders as the default; stored
                 // value untouched (the same weaker-claim discipline).
                 return (defaultValue, true)
             }
@@ -247,6 +249,6 @@ public enum EffectSchemaRegistry {
     }
 
     /// The Inspector's sentence for an Effect this build cannot render.
-    public static let unrecognisedNotice =
+    public static let unrecognizedNotice =
         "This Effect was made with a newer version of Maestro."
 }

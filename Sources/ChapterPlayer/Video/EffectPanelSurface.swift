@@ -83,6 +83,9 @@ final class EffectPanelSurface {
 
     private var surfaces: [String: Surface] = [:]
     private var outputs: [String: AVPlayerItemVideoOutput] = [:]
+    /// The item each channel's tap is attached to, so it can be detached from
+    /// THAT item, wherever the queue has moved it: the Mac's `frameItems`.
+    private var outputItems: [String: AVPlayerItem] = [:]
     private var lastFrames: [String: CIImage] = [:]
     private var lastFrameColorSpaces: [String: CGColorSpace] = [:]
     private var inFlight = false
@@ -120,12 +123,19 @@ final class EffectPanelSurface {
             outputs[channel] = output
         }
         if !item.outputs.contains(where: { $0 === output }) {
+            // DETACH FIRST, as the Mac does. An item the queue has advanced
+            // past is no longer in `items()`, so the sweep below never
+            // reached it and the tap stayed on it.
+            if let previous = outputItems.removeValue(forKey: channel), previous !== item {
+                previous.remove(output)
+            }
             if let queue = player as? AVQueuePlayer {
                 for stale in queue.items() where stale !== item {
                     if stale.outputs.contains(where: { $0 === output }) { stale.remove(output) }
                 }
             }
             item.add(output)
+            outputItems[channel] = item
         }
         let time = item.currentTime()
         guard output.hasNewPixelBuffer(forItemTime: time) || !isPlaying else { return nil }
@@ -211,7 +221,7 @@ final class EffectPanelSurface {
                     progress: progress, extent: extent)
                 result = EffectEvaluator.Result(
                     image: mixed, renderedCount: result.renderedCount + 1,
-                    unrecognised: result.unrecognised)
+                    unrecognized: result.unrecognized)
             }
 
             let width = Int(extent.width)
@@ -357,7 +367,9 @@ final class EffectPanelSurface {
     /// Drop the channel's tap and frame — the channel is gone.
     func forget(channel: String) {
         surfaces.removeValue(forKey: channel)
-        outputs.removeValue(forKey: channel)
+        if let output = outputs.removeValue(forKey: channel) {
+            outputItems.removeValue(forKey: channel)?.remove(output)
+        }
         lastFrames.removeValue(forKey: channel)
         lastFrameColorSpaces.removeValue(forKey: channel)
     }

@@ -718,7 +718,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     }
 
     /// One placement, edited while its Sequence is current. An editor host
-    /// moves the entity itself; this keeps the BASELINE in segment, so a reset
+    /// moves the entity itself; this keeps the BASELINE in sync, so a reset
     /// that does not pass through a fresh Sequence entry returns the object to
     /// where it was just put rather than to the placement it had at entry.
     /// `nil` clears the placement (the Chapter rest applies again).

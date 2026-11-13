@@ -2,8 +2,14 @@
 //  EffectSourceReferences.swift
 //  ChapterPlayer
 //
-//  MIRROR of MaestroKit/Sources/MaestroKit/EffectSourceReferences.swift (FL-09
-//  … FL-13 player parity). Change one, change both.
+//  PARTIAL MIRROR of MaestroKit/Sources/MaestroKit/EffectSourceReferences.swift
+//  (FL-09 … FL-13 player parity). Only `files(in:)` and `occurrences(in:)` are
+//  copied, and `occurrences(in:)` is the same walk. Kit's `sourceClosure(in:)`
+//  (the opaque-reference sites the Final Bundle checks before omitting a
+//  file) has no copy here: the player never omits or deletes files. Kit's
+//  `files(in:)` returns that closure's files sorted and de-duplicated; this
+//  one returns them in stack order and may repeat a file (the LUT loader
+//  keys by file, so a repeat costs nothing). Change a shared rule in both.
 //
 
 import Foundation
@@ -12,7 +18,7 @@ import ChapterScript
 public enum EffectSourceReferences {
 
     /// Every file the stack references, known schemas only — an
-    /// unrecognised Effect's references are preserved in its raw
+    /// unrecognized Effect's references are preserved in its raw
     /// parameters and travel with it.
     public static func files(in stack: [EffectInstance]) -> [String] {
         var out: [String] = []

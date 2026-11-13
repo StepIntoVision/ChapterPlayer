@@ -95,7 +95,12 @@ public final class SubElementKeyDriver {
     public static func sampled(stored: [SubElementOverride],
                                tracks: [SubElementKeyTrack],
                                at time: TimeInterval) -> [SubElementOverride] {
-        var byPath = Dictionary(uniqueKeysWithValues: stored.map { ($0.primPath, $0) })
+        // A primPath stored twice (a hand-edited or peer document) used to
+        // trap here, once per frame. LAST WINS, because that is what the Mac's
+        // `sampled` does (it fills the same map in order); the position is
+        // still the first one, through `order`.
+        var byPath = Dictionary(stored.map { ($0.primPath, $0) },
+                                uniquingKeysWith: { _, last in last })
         var order = stored.map(\.primPath)
         for track in tracks where track.hasAnyKeys {
             var value = byPath[track.primPath]

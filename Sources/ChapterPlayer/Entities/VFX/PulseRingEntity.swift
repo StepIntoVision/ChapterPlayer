@@ -51,8 +51,11 @@ public final class PulseRingEntity: Entity {
             alpha: 1.0
         )
 
-        for i in 0..<config.ringCount {
-            let angle = (Float(i) / Float(config.ringCount)) * 2 * .pi
+        // Clamped: a hand-edited negative count made `0..<count` an invalid
+        // range, which traps rather than drawing no ring.
+        let ringCount = max(0, config.ringCount)
+        for i in 0..<ringCount {
+            let angle = (Float(i) / Float(ringCount)) * 2 * .pi
             var material = PhysicallyBasedMaterial()
             material.baseColor = .init(tint: tint.withAlphaComponent(0.9))
             material.metallic = .init(floatLiteral: 0.2)

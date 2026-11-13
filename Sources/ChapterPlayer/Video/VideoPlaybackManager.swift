@@ -105,6 +105,10 @@ public class VideoPlaybackManager {
     public var effectKeyTracksProvider: (() -> [EffectKeyTrack])?
     let effectSurface = EffectPanelSurface()
     private var surfaceTicker: Task<Void, Never>?
+    /// The authored clock as the previous surface tick read it; nil before
+    /// the first tick and after the ticker stops. `applyRetime` compares
+    /// against it to know whether authored time is moving at all.
+    @ObservationIgnored private var lastSurfaceClock: TimeInterval?
     private var lutBytes: [String: Data] = [:]
     /// A stopped channel HELD for a same-instant dissolve (FL-12): its
     /// player paused on its last frame, its panel still shown, until the
@@ -1170,6 +1174,12 @@ public class VideoPlaybackManager {
     /// torn-down channel never comes back held.
     public private(set) var explorePausedChannels: Set<String> = []
 
+    /// The transport paused every channel (`pauseAll()`), and has not yet
+    /// resumed them or torn them down. Read by the retime tick, which must
+    /// never write a positive rate to a player the transport parked: see
+    /// `applyRetime`.
+    @ObservationIgnored private var transportPaused = false
+
     /// Channels the Sequence asked to play that are not frozen by a hold.
     /// What "everything playing right now" means to a Story Region.
     public var playRequestedChannelNames: [String] {
@@ -1200,6 +1210,7 @@ public class VideoPlaybackManager {
     }
 
     public func pauseAll() {
+        transportPaused = true
         for (_, channel) in channels {
             channel.player.pause()
         }
@@ -1207,6 +1218,7 @@ public class VideoPlaybackManager {
     }
 
     public func resumeAll() {
+        transportPaused = false
         // Only resume channels the sequence actually asked to play.
         // Preheat-only channels are deliberately parked at the clip's
         // first frame (paused, opacity 0) — blanket-playing them here let
@@ -1222,6 +1234,9 @@ public class VideoPlaybackManager {
     }
 
     public func stopAll() {
+        // Every engine route here (`stop`, a relocation) also clears the
+        // engine's own pause, so the next play starts unpaused.
+        transportPaused = false
         for (channel, holding) in held { finishStop(holding.channel, channel: channel) }
         held.removeAll()
         for channel in Array(cutHolds.keys) { releaseCutHold(channel: channel, releasesDestination: true) }
@@ -1467,6 +1482,16 @@ public class VideoPlaybackManager {
                     // player with nothing to project by and drew as a flat
                     // screen, while the Mac Viewer showed the authored shell.
                     let declared = await Self.declaredProjection(of: player)
+                    // LIVENESS, BY PLAYER IDENTITY, the same guard
+                    // `attachImmersiveComponent` makes after its own awaits.
+                    // A stop or a scrub during the metadata load used to
+                    // fall through to the shell mount below and put this
+                    // player's `VideoMaterial` back on a shell the channel
+                    // had already let go of.
+                    guard self.channels[channelKey]?.player === player else {
+                        logger.info("[video.immersive] channel '\(channelKey)' was stopped or rebuilt while its projection metadata loaded: abandoning mount")
+                        return
+                    }
                     if let advisory = ImmersiveMount.advisory(layout: layout, declared: declared) {
                         logger.warning("[video.immersive] channel '\(channelKey)': \(advisory)")
                     }
@@ -1972,6 +1997,7 @@ public class VideoPlaybackManager {
         } else if !needed, let ticker = surfaceTicker {
             ticker.cancel()
             surfaceTicker = nil
+            lastSurfaceClock = nil
             for (key, ch) in channels {
                 if let entity = surfaceEntity(key: key, ch) {
                     effectSurface.restore(channel: key, entity: entity, livePlayer: ch.player)
@@ -2000,12 +2026,22 @@ public class VideoPlaybackManager {
     func surfaceTick() {
         guard let clock = sequenceClock else { return }
         let now = clock()
+        // IS AUTHORED TIME MOVING? The authored clock runs on wall time, so
+        // between two ticks 33 ms apart it moves by tens of milliseconds while
+        // the Sequence plays, and not at all while it is parked: a gate wait
+        // clamps it at the Segment's end, and a pause subtracts the pause.
+        // A jump either way is movement. Without this the engine's gate state
+        // is invisible here, and an ordinary gate wait drove a retimed clip
+        // into the same stutter a pause did (see `applyRetime`).
+        let authoredClockMoving = lastSurfaceClock.map { abs(now - $0) > 1e-4 } ?? true
+        lastSurfaceClock = now
         let keyTracks = effectKeyTracksProvider?() ?? []
         var jobs: [EffectPanelSurface.Job] = []
         var finished: [String] = []
         for (key, ch) in channels {
             guard let entity = surfaceEntity(key: key, ch) else { continue }
-            let sourceTime = applyRetime(key: key, ch, at: now)
+            let sourceTime = applyRetime(key: key, ch, at: now,
+                                         authoredClockMoving: authoredClockMoving)
             applyClipFade(key: key, ch, entity: entity, at: now)
             let stack = ch.effects ?? []
             var job = EffectPanelSurface.Job(
@@ -2081,14 +2117,47 @@ public class VideoPlaybackManager {
     /// cannot run a live reverse; scrub and export are exact). Returns the
     /// mapped source time a `.source` parameter reads.
     @discardableResult
-    private func applyRetime(key: String, _ ch: VideoChannel, at now: TimeInterval) -> Double {
+    private func applyRetime(key: String, _ ch: VideoChannel, at now: TimeInterval,
+                             authoredClockMoving: Bool) -> Double {
         let current = ch.player.currentItem?.currentTime().seconds ?? 0
         guard let curve = ch.retime, !curve.isIdentity,
               let firedAt = ch.firedAt, let span = ch.span, span > 0 else { return current }
         let fraction = min(max((now - firedAt) / span, 0), 1)
         let rate = curve.sourceRate(atFraction: fraction, clipSpan: span)
         let mapped = curve.sourcePosition(atFraction: fraction) ?? current
+        // PAUSED OR HELD: LEAVE THE PLAYER WHERE IT WAS PARKED. Authored time
+        // stands still through a transport pause and an Explore hold, so the
+        // rate below was written into a paused player every tick, restarting
+        // it, and the drift re-cue pulled it back a quarter second later: a
+        // stutter loop for as long as the pause lasted. `resumeAll()` and
+        // `releaseExploreHold` restart the player; the next tick restores
+        // the curve's rate.
+        //
+        // A merely PARKED clock (a gate wait) skips only the positive-rate
+        // work below. A freeze or reverse span still parks the player on its
+        // mapped frame every tick: once parked that does nothing, and it is
+        // the one thing that re-parks a frozen clip after a resume's
+        // `play()` started it.
+        if transportPaused || explorePausedChannels.contains(key) {
+            return mapped
+        }
         if rate > 0.001 {
+            // AN ORDINARY GATE WAIT TOO, and an Explore Continue: authored
+            // time is parked there with the player still running, so `mapped`
+            // stood still while the player moved, and the drift re-cue pulled
+            // it back every quarter second. Left alone, the clip runs on its
+            // own clock through the wait as an unretimed clip does, and the
+            // first tick after the clock moves again re-cues it to the mapped
+            // frame once. Its SPEED is still the curve's: a pause and resume
+            // during the wait restarts the player at 1x, so a running player
+            // gets the curve's rate back. Never one at rate 0: nothing here
+            // may restart a player something else stopped.
+            guard authoredClockMoving else {
+                if ch.player.rate != 0, abs(Double(ch.player.rate) - rate) > 0.001 {
+                    ch.player.rate = Float(rate)
+                }
+                return mapped
+            }
             if abs(Double(ch.player.rate) - rate) > 0.001 { ch.player.rate = Float(rate) }
             // Drift past a quarter second re-cues to the mapped frame.
             if current.isFinite, abs(current - mapped) > 0.25 {

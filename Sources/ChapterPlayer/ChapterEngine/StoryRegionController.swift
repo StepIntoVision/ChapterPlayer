@@ -117,6 +117,9 @@ public final class StoryRegionController {
     /// Loop overrides installed this hold, so `leavingHold` removes exactly
     /// what `enteringHold` added.
     @ObservationIgnored private var installedLoops: Set<String> = []
+    /// The active region has let the story go. Once per region execution:
+    /// the tick after a release must not release again.
+    @ObservationIgnored private var didRelease = false
 
     public init() {}
 
@@ -137,6 +140,7 @@ public final class StoryRegionController {
         clearLoopOverrides()
         regions = []
         active = nil
+        didRelease = false
         isHolding = false
         displayDwell = 0
     }
@@ -157,6 +161,7 @@ public final class StoryRegionController {
         // follows and two adjacent regions cannot both claim an instant.
         if active == nil, let entering = StoryRegionTimeline.region(at: authored, in: regions) {
             active = StoryRegionRuntime(region: entering, enteredAtRuntimeTime: now)
+            didRelease = false
             logger.info("Entered Explore region '\(entering.name ?? entering.id)' at \(String(format: "%.2f", authored))s")
         }
 
@@ -190,15 +195,23 @@ public final class StoryRegionController {
         // the story may go. One call, the same one a tap makes.
         if phase == .resolved || runtime.resolution != nil {
             if isHolding {
-                applyContinuations(for: runtime.region, phase: .leavingHold)
-                clearLoopOverrides()
-                endHoldIfNeeded()
-                displayDwell = 0
+                leaveHold(runtime.region)
                 logger.info("Explore region '\(runtime.region.id)' released — resuming Directed playback")
-                releaseStory?()
+                releaseOnce()
+            } else if Self.isEnd(of: runtime.region, at: authored) {
+                // RESOLVED BEFORE THE HOLD BEGAN, and the story is now AT the
+                // boundary. A fallback no longer than the preview (the
+                // default) expires as the first pass ends, so the hold never
+                // began, and this used to release nothing: the exit gate
+                // waited for an act that was no longer asked for, forever.
+                // There is no hold to leave, only the boundary to let go.
+                // A no-op unless the engine is waiting there; when it is not,
+                // the engine sees the resolved exit and does not wait.
+                releaseOnce()
             }
-            // Resolved during the FIRST PASS: nothing to release, and nothing
-            // to skip. Authored time simply runs to the boundary and out.
+            // Resolved during the FIRST PASS, short of the boundary: nothing
+            // to release, and nothing to skip. Authored time simply runs to
+            // the boundary and out.
         }
 
         // A DWELL READOUT AT ONE HERTZ, not per tick. It is a label whose text
@@ -235,13 +248,47 @@ public final class StoryRegionController {
         endHoldIfNeeded()
     }
 
-    /// The engine crossed a region's end boundary and moved on. Drops the
-    /// active region so the next one can be entered.
+    /// Drops the active region so the next one can be entered, whatever
+    /// position playback is at. For a move that leaves the region without
+    /// passing its exit (a seek, a Segment jump); the segment loop crossing a
+    /// boundary uses `boundaryDidPass(at:)`, which completes a region only at
+    /// its own end.
     public func regionDidComplete() {
         endHoldIfNeeded()
         clearLoopOverrides()
         active = nil
+        didRelease = false
         displayDwell = 0
+    }
+
+    /// THE EXIT RELEASED THE HOLD: the viewer acted, a Memory exit came true,
+    /// or the fallback let the story go, and the story is leaving the
+    /// boundary now.
+    ///
+    /// Runs the leaving-hold continuations, the exit fade among them. They
+    /// used to run only inside `tick`, on the path where the fallback timer
+    /// resolved the region, so an author's exit fade played when the timer
+    /// ran out and never when the viewer was the one who left. Idempotent:
+    /// once the hold has ended there is nothing to leave.
+    public func exitDidRelease() {
+        guard isHolding, let runtime = active else { return }
+        leaveHold(runtime.region)
+        logger.info("Explore region '\(runtime.region.id)' exit released the hold")
+    }
+
+    /// The segment loop crossed the Segment boundary at `boundary` (authored
+    /// Sequence time) and is moving on.
+    ///
+    /// COMPLETES A REGION ONLY AT ITS OWN END. A Segment break inside an
+    /// Explore Area is not the Area's end, and dropping the region there
+    /// re-entered it at the next tick with a fresh fallback timer and its
+    /// resolution forgotten. A hold still on at the end was released by the
+    /// exit, so it leaves through `exitDidRelease` first.
+    public func boundaryDidPass(at boundary: TimeInterval) {
+        guard let runtime = active,
+              runtime.region.endTime <= boundary + Self.boundaryTolerance else { return }
+        exitDidRelease()
+        regionDidComplete()
     }
 
     /// Is the story currently parked in an Explore hold? The engine asks before
@@ -256,9 +303,38 @@ public final class StoryRegionController {
     /// the moment it starts waiting, so the two would race and the shorter one
     /// would silently win.
     ///
-    /// The engine asks this before starting a gate's own timeout. True while a
-    /// region is active, because that gate IS the region's exit.
-    public var ownsActiveGateTiming: Bool { active != nil }
+    /// Read while a gate waits, when the authored clock is parked at that
+    /// gate's boundary. See `ownsGateTiming(atBoundary:)`.
+    public var ownsActiveGateTiming: Bool {
+        guard let authored = authoredClock?() else { return false }
+        return ownsGateTiming(atBoundary: authored)
+    }
+
+    /// True only for the gate at the active region's END, because that gate
+    /// IS the region's exit. A gate on a Segment break inside the Area is an
+    /// ordinary Cue and keeps its own timeout.
+    public func ownsGateTiming(atBoundary boundary: TimeInterval) -> Bool {
+        guard let runtime = active else { return false }
+        return Self.isEnd(of: runtime.region, at: boundary)
+    }
+
+    /// Has the exit of the region ending at `boundary` already resolved? Then
+    /// the story does not stall there: a region resolved during its first
+    /// pass plays to its end and out (`StoryRegionRuntime` rule 2).
+    public func exitAlreadyResolved(atBoundary boundary: TimeInterval) -> Bool {
+        guard let runtime = active, runtime.resolution != nil else { return false }
+        return Self.isEnd(of: runtime.region, at: boundary)
+    }
+
+    /// How close a Segment boundary must be to a region's end to BE that end.
+    /// The compiled break sits on the region's end to within 1e-4 s
+    /// (`StoryRegionEditing`), and the engine sums Segment durations to find
+    /// it, so exact equality is not a test either side can promise.
+    static let boundaryTolerance: TimeInterval = 1e-3
+
+    static func isEnd(of region: StoryRegion, at time: TimeInterval) -> Bool {
+        abs(region.endTime - time) <= boundaryTolerance
+    }
 
     // MARK: - Continuations
 
@@ -292,6 +368,24 @@ public final class StoryRegionController {
             }
             applyContinuation?(continuation.target, continuation.behavior, phase)
         }
+    }
+
+    /// The exit released the hold: the leaving-hold continuations, then the
+    /// hold ends. Said once for the timer's release in `tick` and for every
+    /// other exit in `exitDidRelease`.
+    private func leaveHold(_ region: StoryRegion) {
+        applyContinuations(for: region, phase: .leavingHold)
+        clearLoopOverrides()
+        endHoldIfNeeded()
+        displayDwell = 0
+    }
+
+    /// Let the story go, once per region execution. The same call a tap
+    /// makes (`SequenceEngine.satisfyGate`).
+    private func releaseOnce() {
+        guard !didRelease else { return }
+        didRelease = true
+        releaseStory?()
     }
 
     /// Leave the held state, telling the host exactly once.

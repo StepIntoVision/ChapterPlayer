@@ -93,9 +93,11 @@ public enum StoryHoldPlan {
     public static let backdropStopRefusal =
         "An Environment cannot stop during an Explore Area. Add an empty Environment cue at the boundary instead."
 
-    /// Shown by the editors in place of an audio Hold item until the
-    /// per-channel pause has been heard on a headset. The runtime PERFORMS an
-    /// audio hold; this is about what the editors may promise.
+    /// What the editors may say about an audio Hold until the per-channel
+    /// pause has been heard on a headset. No Inspector shows it yet;
+    /// MaestroKit's `StoryRegionDiagnostics` copies its wording for an audio
+    /// item already set to Hold. The runtime PERFORMS an audio hold; this is
+    /// about what the editors may promise.
     public static let audioHoldUnverifiedNotice =
         "Pausing one sound during an Explore Area has not been verified on Vision Pro. Use Stop or Fade out on exit."
 

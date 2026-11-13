@@ -154,15 +154,16 @@ public struct MoveAction: Sendable {
         duration: TimeInterval = 1.0,
         timing: SegmentTimingFunction = .easeInOut
     ) {
-        assert(headRelativePosition == nil || absolutePosition == nil,
-               "headRelativePosition and absolutePosition are mutually exclusive")
-        assert(!headYOnly || headRelativePosition != nil,
-               "headYOnly requires headRelativePosition to be set")
+        // NORMALIZED, NOT ASSERTED. A hand-edited Chapter can carry both
+        // positions, or `headYOnly` with no head-relative position; a Debug
+        // assert trapped on it while Release played it. The values kept are
+        // the ones `moveEntity` already obeys: the head-relative position wins,
+        // and `headYOnly` means nothing without one.
         self.entity = entity
         self.positionOffset = positionOffset
-        self.absolutePosition = absolutePosition
+        self.absolutePosition = headRelativePosition == nil ? absolutePosition : nil
         self.headRelativePosition = headRelativePosition
-        self.headYOnly = headYOnly
+        self.headYOnly = headYOnly && headRelativePosition != nil
         self.scaleMultiplier = scaleMultiplier
         self.absoluteScale = absoluteScale
         self.absoluteRotation = absoluteRotation
@@ -242,14 +243,12 @@ public struct RevealAction: Sendable {
         fadeIn: TimeInterval = 0,
         manipulable: Bool = false
     ) {
-        assert(headRelativePosition == nil || position == nil,
-               "headRelativePosition and position are mutually exclusive")
-        assert(!headYOnly || headRelativePosition != nil,
-               "headYOnly requires headRelativePosition to be set")
+        // NORMALIZED, NOT ASSERTED, by the rule `MoveAction` states: the
+        // head-relative position wins, as `revealEntity` already plays it.
         self.entity = entity
-        self.position = position
+        self.position = headRelativePosition == nil ? position : nil
         self.headRelativePosition = headRelativePosition
-        self.headYOnly = headYOnly
+        self.headYOnly = headYOnly && headRelativePosition != nil
         self.scale = scale
         self.fadeIn = max(fadeIn, 0)
         self.manipulable = manipulable

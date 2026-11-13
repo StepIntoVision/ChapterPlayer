@@ -130,6 +130,7 @@ public class SpatialAudioManager {
         var file: String
         var startTime: Date
         var duration: TimeInterval
+        var isLooping: Bool = false
     }
 
     // MARK: - AVAudioEngine (3B)
@@ -159,12 +160,26 @@ public class SpatialAudioManager {
     private var ambientChannels: [String: AmbientChannel] = [:]
     private var spatialChannels: [String: SpatialChannel] = [:]
     private var preloadedResources: [String: AudioFileResource] = [:]
+    /// Appended to a file name to key its LOOPING resource in
+    /// `preloadedResources`, apart from the one-shot of the same file.
+    private static let loopingResourceSuffix = "#loop"
+    /// Positional voices the transport paused (`pauseAll()`), and only those:
+    /// `resumeAll()` restarts exactly this set, so a one-shot that had already
+    /// ended is never started again by a resume.
+    @ObservationIgnored private var transportPausedSpatialChannels: Set<String> = []
 
     // MARK: - Preload Cache
 
     /// URL cache populated by preload(). Used by findAudioURL() for catalog files.
     /// Populated alongside preloadedResources in preload() — they share the same lifecycle.
     public private(set) var resolvedURLs: [String: URL] = [:]
+    /// Files `preload(files:)` itself loaded into `preloadedResources` under
+    /// the plain name, and only those. `resolvedURLs` is no proof of that: an
+    /// on-demand load fills it too (the looping resource included, which is
+    /// cached under its own key), and so does a preload whose load failed.
+    /// The "preloaded file vanished" check reads this set, so it fires only
+    /// for a resource that really was warmed.
+    @ObservationIgnored private var preloadWarmedFiles: Set<String> = []
 
     // MARK: - Mix State (1A)
 
@@ -238,8 +253,8 @@ public class SpatialAudioManager {
     // MARK: - Performance Instrumentation (Phase 1 — spec 038)
 
 #if DEBUG
-    /// Signposter for audio path profiling. Measures cold-start costs at beat 1.
-    /// Visible in Instruments → Logging track under subsystem "groovejones.hsbc", category "AudioPerf".
+    /// Signposter for audio path profiling. Measures cold-start costs at the first Segment.
+    /// Visible in Instruments → Logging track under the app's bundle identifier, category "AudioPerf".
     private let audioSignposter = OSSignposter(
         subsystem: Bundle.main.bundleIdentifier ?? "com.shellcorp.sharedvisions",
         category: "AudioPerf"
@@ -463,9 +478,10 @@ public class SpatialAudioManager {
 
     // MARK: - Prewarm (spec 038)
 
-    /// Pre-stage ambient audio channels for a beat’s actions before the beat engine starts.
-    /// Call from playCatalogScene() before beatEngine.play(). The prewarm completes synchronously
-    /// before beatEngine.play() starts its async Task, guaranteeing beat 1 finds pre-staged nodes.
+    /// Pre-stage ambient audio channels for a Segment's actions before the engine starts.
+    /// Nothing in ChapterPlayer, MaestroStudio or MaestroVision calls it today; it is public for a
+    /// host app. Called synchronously before `SequenceEngine.play`, the first Segment finds
+    /// pre-staged nodes (`stopAll()` keeps them; only `stopEverything()` clears them).
     ///
     /// Only covers the simple ambient path (spatial == nil, loopConfig == nil).
     /// loopConfig channels have multi-phase scheduling (intro/loop/outro) and are not prewarmed.
@@ -547,6 +563,7 @@ public class SpatialAudioManager {
                 do {
                     let resource = try AudioFileResource.load(contentsOf: url)
                     preloadedResources[file] = resource
+                    preloadWarmedFiles.insert(file)
                     loadedCount += 1
                     logger.debug("Preloaded audio: \(file)")
                 } catch {
@@ -1565,7 +1582,7 @@ public class SpatialAudioManager {
 
         let resolvedFile = resolveVariation(for: action.file)
 
-        // PRELOAD IS AN OPTIMISATION, NOT A PRECONDITION.
+        // PRELOAD IS AN OPTIMIZATION, NOT A PRECONDITION.
         //
         // This used to require `preloadedResources[resolvedFile]` and drop the
         // cue otherwise — and `preload(files:)` is called by the consumer app,
@@ -1574,18 +1591,37 @@ public class SpatialAudioManager {
         // while every placed sound dropped, which is exactly what the device
         // test found. Load on demand and cache it, so a cue plays whether or
         // not anyone warmed it first.
-        if preloadedResources[resolvedFile] == nil, let url = findAudioURL(file: resolvedFile) {
+        //
+        // LOOP IS A PROPERTY OF THE RESOURCE here (`Configuration.shouldLoop`),
+        // not of the controller, so a looping cue gets its own resource,
+        // cached apart from the one-shot `preload(files:)` warms. A plain
+        // `loop` used to be dropped on this path, which is the very form the
+        // intro/loop/outro fallback above tells an author to use instead.
+        //
+        // THE LOOPING RESOURCE STREAMS. `preload(files:)` warms only the
+        // one-shot, so this load runs on the main actor when the cue fires,
+        // and the default `.preload` strategy would decode the whole file
+        // there (a hitch on the render path for a long bed) and then keep a
+        // second full PCM copy beside the one-shot for the session. A looping
+        // positional cue is a bed by nature; streaming opens the file without
+        // decoding it and holds no decoded copy.
+        let resourceKey = action.loop ? resolvedFile + Self.loopingResourceSuffix : resolvedFile
+        if preloadedResources[resourceKey] == nil, let url = findAudioURL(file: resolvedFile) {
             do {
-                let resource = try AudioFileResource.load(contentsOf: url)
-                preloadedResources[resolvedFile] = resource
+                let resource = try AudioFileResource.load(
+                    contentsOf: url,
+                    configuration: .init(
+                        loadingStrategy: action.loop ? .stream : .preload,
+                        shouldLoop: action.loop))
+                preloadedResources[resourceKey] = resource
                 resolvedURLs[resolvedFile] = url
-                logger.info("Loaded spatial audio on demand: \(resolvedFile, privacy: .public)")
+                logger.info("Loaded spatial audio on demand: \(resolvedFile, privacy: .public)\(action.loop ? " (looping)" : "", privacy: .public)")
             } catch {
                 logger.error("Could not load spatial audio \(resolvedFile, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
 
-        if let resource = preloadedResources[resolvedFile] {
+        if let resource = preloadedResources[resourceKey] {
             let vol = effectiveVolume(requested: action.volume, channel: action.channel)
             let controller = sourceEntity.playAudio(resource)
             controller.gain = Audio.Decibel(volumeToDecibels(vol))
@@ -1596,12 +1632,20 @@ public class SpatialAudioManager {
                 targetVolume: action.volume,
                 file: resolvedFile,
                 startTime: .now,
-                duration: 0 // RealityKit doesn't expose duration easily
+                duration: 0, // RealityKit doesn't expose duration easily
+                isLooping: action.loop
             )
             logger.info("Playing spatial: \(resolvedFile) on channel '\(action.channel)'")
         } else {
             let ctx = segmentContext ?? "unknown"
-            let wasPreloaded = resolvedURLs[resolvedFile] != nil
+            // Only the one-shot resource is what `preload(files:)` warms; a
+            // looping load that failed is an ordinary load failure, logged above.
+            // And only a file preload actually LOADED counts: `resolvedURLs`
+            // is also set by an on-demand load (a looping cue on the same file
+            // fills it with no plain-name resource) and by a failed preload,
+            // and a later one-shot whose load then failed trapped here in a
+            // Debug build although nothing had been warmed.
+            let wasPreloaded = !action.loop && preloadWarmedFiles.contains(resolvedFile)
             logger.error("Spatial audio DROPPED — file: \(resolvedFile), channel: \(action.channel), beat: \(ctx). Not in preloadedResources.")
             if wasPreloaded {
                 // Logic error: preload found this file but it's not in preloadedResources
@@ -1657,6 +1701,8 @@ public class SpatialAudioManager {
 
     private func stopSpatial(channel: String) {
         explorePausedChannels.remove(channel)
+        transportPausedSpatialChannels.remove(channel)
+        exploreHeldSoundingSpatialChannels.remove(channel)
         if let ch = spatialChannels.removeValue(forKey: channel) {
             ch.controller?.stop()
             ch.entity.removeFromParent()
@@ -1700,10 +1746,20 @@ public class SpatialAudioManager {
             activeZoneChannels.removeValue(forKey: zoneId)
         }
         explorePausedChannels = explorePausedChannels.filter { hasChannel($0) }
+        exploreHeldSoundingSpatialChannels.formIntersection(explorePausedChannels)
     }
 
     public func stopEverything() {
         explorePausedChannels.removeAll()
+        exploreHeldSoundingSpatialChannels.removeAll()
+        // PIPELINE B TOO. Encoded Spatial Mix masters play in their own
+        // players, outside the graph `audioEngine.stop()` below silences, so a
+        // full reset that skipped them left a master sounding under whatever
+        // came next. Their gain ramps go first: a ramp still in flight would
+        // otherwise write into, or stop, a master started on the same channel.
+        for task in systemSpatialFadeTasks.values { task.cancel() }
+        systemSpatialFadeTasks.removeAll()
+        systemSpatialMedia.stopAll()
         for key in ambientChannels.keys {
             cancelLoopState(channel: key)
             stopAmbient(channel: key)
@@ -1715,8 +1771,8 @@ public class SpatialAudioManager {
         activeZoneChannels.removeAll()
         clearAllDuckingState()
         // Clear prewarm pool on full shutdown.
-        // stopAll() intentionally does NOT clear this — prewarm must survive BeatEngine.play()’s
-        // internal stop(resetEntities: false) → stopAll() call and reach beat 1.
+        // stopAll() intentionally does NOT clear this — prewarm must survive SequenceEngine.play()’s
+        // internal stop() → stopAll() call (not a full reset) and reach the first Segment.
         for (_, ch) in prewarmedChannels {
             ch.fadeTask?.cancel()
             cleanupPlayerNode(ch.playerNode)
@@ -1727,8 +1783,9 @@ public class SpatialAudioManager {
 
     // MARK: - Pause / Resume
 
-    /// Pauses all ambient channel player nodes. Cancels active fade tasks but preserves channel state.
-    /// Spatial channels (AudioPlaybackController) don't support pause — noted as a limitation.
+    /// Pauses every channel where it is: ambient player nodes (cancelling
+    /// their fade tasks but keeping channel state), encoded masters, and
+    /// positional voices.
     public func pauseAll() {
         // STATE CHANGE, not a per-frame seek. A gate, a transport pause and a
         // Timeline jump are events; the encoded player is told when one
@@ -1745,14 +1802,22 @@ public class SpatialAudioManager {
             ch.outgoingPlayerNode?.pause()
             ambientChannels[key] = ch  // single write-back
         }
-        for (_, channel) in spatialChannels {
-            // AudioPlaybackController doesn't expose pause — mute as workaround.
-            channel.controller?.gain = Audio.Decibel(volumeToDecibels(0))
+        for (key, channel) in spatialChannels {
+            // A REAL PAUSE. This used to mute instead, so a positional voice
+            // kept running silently through the pause (and came back late),
+            // and any mix write during the pause un-muted it. The same
+            // `AudioPlaybackController.pause()` an Explore hold uses. Only a
+            // voice that is sounding: see `transportPausedSpatialChannels`.
+            guard let controller = channel.controller, controller.isPlaying else { continue }
+            controller.pause()
+            transportPausedSpatialChannels.insert(key)
         }
         logger.info("Paused all audio (\(self.ambientChannels.count) ambient, \(self.spatialChannels.count) spatial)")
     }
 
-    /// Resumes all ambient channel player nodes from where they were paused.
+    /// Resumes, from where they were paused, every channel `pauseAll()`
+    /// paused: encoded masters, ambient player nodes (and an outgoing
+    /// crossfade node), and the positional voices it recorded.
     ///
     /// Never a channel an Explore hold paused: the region releases that one,
     /// and a transport pause and resume during a hold must not restart it.
@@ -1768,13 +1833,14 @@ public class SpatialAudioManager {
             // Resume outgoing crossfade node if it was mid-transition
             channel.outgoingPlayerNode?.play()
         }
-        // Gain is restored for EVERY spatial channel, held or not: `pauseAll()`
-        // mutes these rather than pausing them, and a held channel whose gain
-        // stayed at zero would come back silent when its region releases it.
-        for (channelKey, channel) in spatialChannels {
-            let vol = effectiveVolume(requested: channel.targetVolume, channel: channelKey)
-            channel.controller?.gain = Audio.Decibel(volumeToDecibels(vol))
+        // Exactly the positional voices `pauseAll()` paused, or a hold released
+        // while the transport was paused. One a hold still owns stays paused;
+        // `releaseExploreHold` restarts it.
+        for channelKey in transportPausedSpatialChannels
+        where !explorePausedChannels.contains(channelKey) {
+            spatialChannels[channelKey]?.controller?.play()
         }
+        transportPausedSpatialChannels.removeAll()
         logger.info("Resumed all audio (\(self.ambientChannels.count) ambient, \(self.spatialChannels.count) spatial)")
     }
 
@@ -1783,6 +1849,14 @@ public class SpatialAudioManager {
     /// Channels an Explore hold has paused. Consulted by `resumeAll()` and
     /// pruned wherever a channel is torn down.
     public private(set) var explorePausedChannels: Set<String> = []
+
+    /// The held channels whose POSITIONAL voice was sounding when the hold
+    /// took it: playing, or parked by the transport (`pauseAll()`). A subset
+    /// of `explorePausedChannels`. A one-shot that had already ended keeps
+    /// its `spatialChannels` entry, so `hasChannel` lets a hold take it; only
+    /// a voice recorded here is played again when the hold lets go, or handed
+    /// to the transport's restart set, so a finished one-shot never replays.
+    @ObservationIgnored private var exploreHeldSoundingSpatialChannels: Set<String> = []
 
     /// Is anything playing on `channel`, on any of the three backends?
     public func hasChannel(_ channel: String) -> Bool {
@@ -1805,11 +1879,23 @@ public class SpatialAudioManager {
     @discardableResult
     public func pauseForExploreHold(channel: String) -> Bool {
         guard hasChannel(channel) else { return false }
-        explorePausedChannels.insert(channel)
+        let newlyHeld = explorePausedChannels.insert(channel).inserted
         systemSpatialMedia.pause(channel: channel)
         if let ch = ambientChannels[channel] {
             ch.playerNode.pause()
             ch.outgoingPlayerNode?.pause()
+        }
+        // Read BEFORE the pause below, which makes every voice report not
+        // playing. A second hold on a channel already held keeps the first
+        // record: by now its own pause has silenced the voice.
+        if newlyHeld {
+            let positionalSounding = spatialChannels[channel]?.controller?.isPlaying == true
+                || transportPausedSpatialChannels.contains(channel)
+            if positionalSounding {
+                exploreHeldSoundingSpatialChannels.insert(channel)
+            } else {
+                exploreHeldSoundingSpatialChannels.remove(channel)
+            }
         }
         spatialChannels[channel]?.controller?.pause()
         logger.info("[explore] audio channel '\(channel)' paused for the hold")
@@ -1819,13 +1905,24 @@ public class SpatialAudioManager {
     /// Let a paused channel go. `resume` is false while the transport itself
     /// is paused: the hold is over, and `resumeAll()` owns the restart.
     public func releaseExploreHold(channel: String, resume: Bool) {
-        guard explorePausedChannels.remove(channel) != nil, resume else { return }
+        // Only a positional voice that was sounding when the hold took it is
+        // started again: see `exploreHeldSoundingSpatialChannels`.
+        let positionalWasSounding = exploreHeldSoundingSpatialChannels.remove(channel) != nil
+        guard explorePausedChannels.remove(channel) != nil else { return }
+        guard resume else {
+            // The transport's pause now owns this positional voice: hand it to
+            // the set `resumeAll()` restarts, or it would stay paused for good.
+            if positionalWasSounding, spatialChannels[channel] != nil {
+                transportPausedSpatialChannels.insert(channel)
+            }
+            return
+        }
         systemSpatialMedia.resume(channel: channel)
         if let ch = ambientChannels[channel] {
             ch.playerNode.play()
             ch.outgoingPlayerNode?.play()
         }
-        spatialChannels[channel]?.controller?.play()
+        if positionalWasSounding { spatialChannels[channel]?.controller?.play() }
         logger.info("[explore] audio channel '\(channel)' resumes")
     }
 
@@ -2170,7 +2267,7 @@ public class SpatialAudioManager {
                 channel: channel, file: ch.file, category: cat, busId: bus,
                 targetVolume: ch.targetVolume, effectiveVolume: eff,
                 isDucked: isDucked, duckMultiplier: duckMul,
-                isLooping: false, loopPhase: "one-shot",
+                isLooping: ch.isLooping, loopPhase: ch.isLooping ? "looping" : "one-shot",
                 spatialInfo: spatial
             )
         }

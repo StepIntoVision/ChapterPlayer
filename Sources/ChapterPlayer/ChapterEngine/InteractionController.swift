@@ -784,7 +784,7 @@ public final class InteractionController {
         case .none:
             return nil
         case .automatic:
-            // The system's own default, deliberately unparameterised.
+            // The system's own default, deliberately unparameterized.
             return HoverEffectComponent()
         case .highlight:
             var style = HoverEffectComponent.HighlightHoverEffectStyle.default

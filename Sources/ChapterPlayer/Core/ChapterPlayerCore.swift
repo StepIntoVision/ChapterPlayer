@@ -503,7 +503,11 @@ open class ChapterPlayerCore {
             let outcome = probe.handleCompletion(
                 current.onComplete.authored, from: current.id,
                 exists: { self.sequenceFromLoadedDocument(id: $0) != nil },
-                start: { self.loadedExperience?.document.defaultSequenceId })
+                start: { self.loadedExperience?.document.defaultSequenceId },
+                // The same Memory the completion itself will read, so a
+                // "Continue by the Story…" ending warms the branch it will
+                // actually take rather than its Otherwise.
+                storyState: self.storyState.ledger)
             guard case .enter(let next, _, _) = outcome else { return nil }
             return self.sequenceFromLoadedDocument(id: next)
         }
@@ -696,16 +700,44 @@ open class ChapterPlayerCore {
         // execution path with every new navigation kind.
         sequenceEngine.onSequenceComplete = { [weak self] completion in
             guard let self, let finished = self.activeSequenceId else { return }
+            // A FINISHED SEQUENCE IS AT ITS END. Captured now, before the
+            // engine's clock reads 0 (a completion that is not a hold stops
+            // it), so a Return · Resume into it lands on its last Segment
+            // as the Mac does, rather than replaying it from Segment 1.
+            let endPosition = self.sequenceEngine.totalDuration
             Task { @MainActor in
-                let outcome = self.navigator.handleCompletion(
-                    completion.authored,
-                    from: finished,
-                    exists: { self.sequenceFromLoadedDocument(id: $0) != nil },
-                    start: { self.loadedExperience?.document.defaultSequenceId },
-                    currentPosition: self.sequenceEngine.sequenceAnimationTime)
-                await self.perform(outcome)
+                await self.performCompletion(completion.authored, from: finished,
+                                             endingAt: endPosition)
             }
         }
+    }
+
+    /// THE ONE COMPLETION PATH. A Sequence finished and its authored ending
+    /// says where the story goes: the navigator decides, `perform` carries
+    /// it out.
+    ///
+    /// Public so a host's QA harness reaches the SAME decision the engine's
+    /// completion does, with the same Memory and the same position, rather
+    /// than a copy of the navigator call that supplies its own arguments.
+    /// A "Continue by the Story…" ending is resolved against this session's
+    /// Memory; resolved against an empty ledger, every branch took its
+    /// Otherwise on the headset.
+    ///
+    /// - Parameter position: where the finished visit stands, which is its
+    ///   end. A completion that suspends it (Continue to) records this as
+    ///   the place a Return · Resume comes back to.
+    @MainActor
+    public func performCompletion(_ completion: CompletionActionDTO,
+                                  from finished: String,
+                                  endingAt position: TimeInterval) async {
+        let outcome = navigator.handleCompletion(
+            completion,
+            from: finished,
+            exists: { self.sequenceFromLoadedDocument(id: $0) != nil },
+            start: { self.loadedExperience?.document.defaultSequenceId },
+            currentPosition: position,
+            storyState: storyState.ledger)
+        await perform(outcome)
     }
 
     // MARK: - Sequence control
@@ -944,7 +976,7 @@ open class ChapterPlayerCore {
     /// can. Video holds its last frame by default (`docs/STORY_REGIONS.md`
     /// §6); an absent continuation used to do nothing at all here, so the
     /// documented default kept playing on device while the Sequence clock
-    /// stood still, and came back out of segment with its own Timeline.
+    /// stood still, and came back out of sync with its own Timeline.
     private func applyDefaultStoryHold(for region: StoryRegion) {
         var configured: Set<String> = []
         for continuation in region.continuations {
@@ -1521,13 +1553,13 @@ open class ChapterPlayerCore {
                     mesh = MeshResource.generateSphere(radius: radius)
                 case .equirect180, .appleImmersive, .custom:
                     // PARTIAL SHELL from the authored coverage: the shell
-                    // sweeps exactly `field.horizontalDegrees`, centerd on
+                    // sweeps exactly `field.horizontalDegrees`, centered on
                     // forward, so a 180° plate stops at the hemisphere
                     // boundary and a 190°/220° plate sweeps its real field
                     // instead of being smeared across a full sphere
                     // (ShellGeometry — the runtime twin of the Mac's
-                    // `MaestroKit.BackdropGeometry`, conventions in
-                    // lock-segment by contract).
+                    // `MaestroKit.BackdropGeometry`, conventions kept
+                    // in sync by contract).
                     //
                     // NOTE: Apple Immersive remains an EDITOR APPROXIMATION
                     // here — Apple's projection is parametric fisheye, not

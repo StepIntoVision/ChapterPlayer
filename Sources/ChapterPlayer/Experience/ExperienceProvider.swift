@@ -144,8 +144,12 @@ public struct LocalFolderExperienceProvider: ExperienceProvider {
         }
 
         let assetsRoot = root.appending(path: ChapterScriptFormat.assetsFolderName)
+        // FIRST WINS, as `AssetManifest.entry(id:)` answers. A hand-edited or
+        // merged manifest can repeat an id, and `uniqueKeysWithValues` traps
+        // on that instead of loading the Chapter.
         let pathMap = Dictionary(
-            uniqueKeysWithValues: document.manifest.entries.map { ($0.id, $0.relativePath) }
+            document.manifest.entries.map { ($0.id, $0.relativePath) },
+            uniquingKeysWith: { first, _ in first }
         )
         let resolver = LocalFolderMediaResolver(assetsRoot: assetsRoot, pathById: pathMap)
         return LoadedExperience(document: document, mediaResolver: resolver, rootURL: root)

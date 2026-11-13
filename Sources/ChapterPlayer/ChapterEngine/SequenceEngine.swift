@@ -606,6 +606,12 @@ public final class SequenceEngine {
         logger.info("Jumping to segment index \(index): \(sequence.segments[index].id)")
 
         tearDownForRelocation()
+        // A jump leaves an Explore region without passing its exit, exactly
+        // as a seek does. Kept, the region went on timing its fallback from
+        // the old entry, and a jump past its end read as a hold while the
+        // story was playing. The next tick enters whichever region holds the
+        // Segment landed on.
+        storyRegions?.regionDidComplete()
 
         var elapsed: TimeInterval = 0
         for i in 0..<index {
@@ -876,6 +882,12 @@ public final class SequenceEngine {
         let segmentCount = sequence.segments.count
         logger.notice("▶ runSegmentsFrom: sequence=\(sequence.id) startIndex=\(startIndex) segmentCount=\(segmentCount) isCancelled=\(Task.isCancelled)")
 
+        // Where the current Segment ENDS on the authored Sequence clock: the
+        // boundary its gate waits at. Summed the way `sequenceAnimationTime`
+        // sums it, so a gate wait's parked clock reads exactly this.
+        var segmentEnd: TimeInterval = 0
+        for i in 0..<min(startIndex, segmentCount) { segmentEnd += sequence.segments[i].duration }
+
         for index in startIndex..<segmentCount {
             let segment = sequence.segments[index]
             guard !Task.isCancelled else {
@@ -883,6 +895,7 @@ public final class SequenceEngine {
                 return nil
             }
 
+            segmentEnd += segment.duration
             currentSegmentIndex = index
             let enteredAt = index == startIndex ? max(0, min(startOffset, segment.duration)) : 0
             segmentStartTime = Date.now.addingTimeInterval(-enteredAt)
@@ -957,6 +970,13 @@ public final class SequenceEngine {
                     await withCheckedContinuation { continuation in
                         pauseContinuation = continuation
                     }
+                    // A STOP OR A JUMP ALSO WAKES A PAUSED LOOP, by resuming
+                    // this continuation as it cancels the task. Carrying on
+                    // fired this Segment's due actions into whatever had
+                    // started since, and clearing the continuation below
+                    // could drop the NEW loop's pause, so its Resume never
+                    // woke it. Whoever resumed it has already cleared it.
+                    guard !Task.isCancelled else { return nil }
                     pauseContinuation = nil
                     sendStatus()
                 }
@@ -1030,20 +1050,31 @@ public final class SequenceEngine {
                     await withCheckedContinuation { continuation in
                         pauseContinuation = continuation
                     }
+                    // Same reason as the pause inside the timing loop: a
+                    // cancelled loop must not go on to wait at this gate,
+                    // which would take over the NEW loop's gate state.
+                    guard !Task.isCancelled else { return nil }
                     pauseContinuation = nil
                 }
 
-                await waitAtGate(gate)
+                await waitAtGate(gate, atBoundary: segmentEnd)
             }
+
+            // `clearGate` (a stop, a jump, a seek) also ends the wait above.
+            // Only a wait that was RELEASED may complete a region; a cancelled
+            // one would drop the region the new playback just entered.
+            guard !Task.isCancelled else { return nil }
 
             // A REGION ENDING AT THIS BOUNDARY HAS NOW BEEN RELEASED.
             //
             // The gate above is the region's exit, so reaching here means it
-            // was satisfied — by the viewer, by the region's fallback timer, or
-            // by the gate's own timeout. Drop the active region so the next one
-            // can be entered, and so a second region starting at this exact
-            // boundary is not mistaken for the one just left.
-            storyRegions?.regionDidComplete()
+            // was satisfied, by the viewer, by Memory or by the region's
+            // fallback timer. Complete it (a hold still on leaves through its
+            // leaving-hold continuations first) so the next one can be
+            // entered, and so a second region starting at this exact boundary
+            // is not mistaken for the one just left. A boundary INSIDE a
+            // region completes nothing.
+            storyRegions?.boundaryDidPass(at: segmentEnd)
         }
 
         guard !Task.isCancelled else { return nil }
@@ -1080,6 +1111,13 @@ public final class SequenceEngine {
 
     /// Satisfy the active gate, resuming playback.
     public func satisfyGate() {
+        satisfyGate(resumingPlayback: true)
+    }
+
+    /// The one release. `resumingPlayback` is false only for a TIMER: an act
+    /// that satisfies a gate while the transport is paused also resumes it,
+    /// but a gate timeout must never un-pause what the person paused.
+    private func satisfyGate(resumingPlayback: Bool) {
         guard isWaiting else { return }
         logger.info("Gate satisfied")
         gateTimeoutTask?.cancel()
@@ -1092,7 +1130,7 @@ public final class SequenceEngine {
         onGateEnded?()
         gateContinuation?.resume()
         gateContinuation = nil
-        if isPaused {
+        if resumingPlayback, isPaused {
             resume()
         }
         sendStatus()
@@ -1115,7 +1153,10 @@ public final class SequenceEngine {
     }
 
     /// Wait at a gate, respecting pause. Returns when gate is satisfied or task cancelled.
-    private func waitAtGate(_ gate: SegmentGate) async {
+    ///
+    /// - Parameter boundary: where the gate's Segment ends on the authored
+    ///   Sequence clock, which is how an Explore region recognizes ITS exit.
+    private func waitAtGate(_ gate: SegmentGate, atBoundary boundary: TimeInterval) async {
         // A GATE ASKS "IS THIS TRUE?", NOT "DID THIS JUST HAPPEN".
         //
         // So a story-condition boundary whose facts ALREADY hold does not stall
@@ -1126,6 +1167,15 @@ public final class SequenceEngine {
         if let store = storyState,
            GateActivation.satisfiedByStory(gate.authored, in: store.ledger) {
             logger.info("[gate] story conditions already hold; the boundary does not stall")
+            return
+        }
+
+        // AN EXPLORE EXIT THAT ALREADY RESOLVED does not stall either. Its
+        // fallback can expire, or the viewer can act, before the first pass
+        // reaches the boundary, and the story then plays to the end and out.
+        // Waiting here asked again for an act the region no longer wanted.
+        if storyRegions?.exitAlreadyResolved(atBoundary: boundary) == true {
+            logger.info("[explore] the Explore Area's exit already resolved; the boundary does not stall")
             return
         }
 
@@ -1142,18 +1192,29 @@ public final class SequenceEngine {
 
         // A STORY REGION OWNS ITS OWN TIMING. Its fallback runs from region
         // ENTRY on the pause-aware clock; a gate timeout would run from HERE,
-        // on a `Task.sleep`, and the two would race. Ordinary Segment gates are
-        // untouched — this only skips the gate timer when the gate IS a
-        // region's exit.
-        let regionOwnsTiming = storyRegions?.ownsActiveGateTiming == true
+        // and the two would race. Ordinary Segment gates are untouched — this
+        // only skips the gate timer when the gate IS a region's exit, and only
+        // the gate at the region's END is: a gate on a Segment break inside
+        // the Area is an ordinary Cue and keeps its timeout.
+        let regionOwnsTiming = storyRegions?.ownsGateTiming(atBoundary: boundary) == true
         if regionOwnsTiming, gate.timeout != nil {
             logger.info("[explore] ignoring the exit gate's own timeout — the Story Region's fallback owns this region's timing")
         }
         if let timeout = gate.timeout, !regionOwnsTiming {
+            // THE PAUSE-AWARE CLOCK, polled. A `Task.sleep` of the whole
+            // timeout kept counting while the person had paused, then
+            // released the gate and un-paused them. `totalElapsed` stands
+            // still while paused, so the timeout does too, and the release
+            // never resumes playback: a timer does not press Play.
+            let waitBegan = totalElapsed
             gateTimeoutTask = Task { @MainActor in
-                try? await Task.sleep(for: .seconds(timeout))
+                while !Task.isCancelled {
+                    let left = timeout - (self.totalElapsed - waitBegan)
+                    if left <= 0, !self.isPaused { break }
+                    try? await Task.sleep(for: .seconds(min(max(left, 0.05), 0.25)))
+                }
                 guard !Task.isCancelled else { return }
-                self.satisfyGate()
+                self.satisfyGate(resumingPlayback: false)
             }
         }
 
@@ -1168,11 +1229,17 @@ public final class SequenceEngine {
         // clock and compares a handful of regions; it never walks the document,
         // rebuilds a projection or issues a media command unless a phase
         // actually changed.
+        //
+        // NOT WHILE PAUSED. The region's clock stands still then, so a tick
+        // has nothing to advance, and a release from a paused pump would
+        // reach `satisfyGate`, which resumes playback: a timer must never
+        // press Play. The segment loop does not tick while paused either.
         if storyRegions?.active != nil {
             exploreTickTask = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .milliseconds(250))
                     guard let self, !Task.isCancelled else { return }
+                    guard !self.isPaused else { continue }
                     self.storyRegions?.tick()
                 }
             }
@@ -1181,7 +1248,9 @@ public final class SequenceEngine {
         await withCheckedContinuation { continuation in
             gateContinuation = continuation
         }
-        gateContinuation = nil
+        // Whoever resumed it already cleared it. A CANCELLED wait (a stop or
+        // a jump) must not clear it again: by now it may be the new loop's.
+        if !Task.isCancelled { gateContinuation = nil }
     }
 
     private func clearGate() {
