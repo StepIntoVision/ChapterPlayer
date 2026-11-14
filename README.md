@@ -4,7 +4,7 @@ The open source visionOS runtime that plays [ChapterScript](https://github.com/S
 
 ChapterPlayer is the same runtime that powers headset playback in [Maestro](https://maestrostud.io), the commercial authoring suite: MaestroVision embeds it unchanged. Maestro's Mac editor previews with its own evaluator, not with ChapterPlayer. Website: [chapterscript.com](https://chapterscript.com).
 
-It reads ChapterScript **format 8**. Documents saved in formats 2–7 are migrated on load (`Migrator.migrate`; format 8 moves each Object's Interactions into the Sequences that use it); a document newer than the linked ChapterScript fails to load with `sourceVersionTooNew`. Over a Maestro live link the format is stated, not gated: a newer Mac document is decoded as it stands and the host is told the two versions differ.
+It reads ChapterScript **format 9**. Documents saved in formats 2–8 are migrated on load (`Migrator.migrate`; format 8 moves each Object's Interactions into the Sequences that use it, and format 9 moves its Interaction Feedback the same way); a document newer than the linked ChapterScript fails to load with `sourceVersionTooNew`. Over a Maestro live link the format is stated, not gated: a newer Mac document is decoded as it stands and the host is told the two versions differ.
 
 ## What's in the package
 

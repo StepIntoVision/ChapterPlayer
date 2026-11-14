@@ -27,19 +27,36 @@
 //  vertices the GPU interpolates linearly, which is the only approximation;
 //  at 32 by 24 cells it is far below a pixel of a panel at reading distance.
 //
-//  WHAT IS NOT DRAWN, AND WHY. Convergence moves one eye's picture against
-//  the other's, and the headset has no per-eye surface for a panel: a
-//  `VideoMaterial` plane shows one texture to both eyes. The value is
-//  resolved here exactly as the Mac resolves it, so the surface that needs it
-//  reads the right number on the day it exists; until then the player logs
-//  that it was authored and not rendered, rather than pretending.
+//  THE PER-EYE PANEL SURFACE (OD-24). Convergence moves one eye's picture
+//  against the other's, and a frame-packed master holds two pictures in one
+//  raster; a `VideoMaterial` plane shows one texture to both eyes, so neither
+//  can be drawn through it. `StereoPanelMaterial` (the `StereoPanel.usda`
+//  ShaderGraph resource, which switches on the camera index) samples each
+//  eye's own rectangle of the decoded frame. WHICH rectangle is decided
+//  here, by the Mac's rule (`SourceMediaInterpretation.region(for:)`, mirrored
+//  line for line and held to it by `RuntimeRealizationTests`): the packing
+//  and eye order pick the half, and the effective disparity (the file's own
+//  adjustment plus the occurrence's Convergence) shifts each eye by half of
+//  it, in opposite directions, in units of that eye's width.
+//
+//  A Flat View on a per-eye surface is built with eye-local texture
+//  coordinates (`region: .whole`) and the surface maps them into each eye's
+//  rectangle, so the panel is cut from both eyes rather than from the left
+//  one alone.
+//
+//  NOT YET BOUND. `VideoPlaybackManager` still draws every panel through
+//  `VideoMaterial` (a Flat View from the left eye) and logs an authored
+//  Convergence as not rendered. Binding `StereoPanelMaterial` to a panel's
+//  decoded frames, when `needsPerEyeSurface` says so, is the remaining work
+//  of TODO-66, and only a worn Vision Pro can say the result is right.
 //
 //  Pure: no RealityKit, no AVFoundation, so every rule is testable without a
-//  scene.
+//  scene. The one exception is the Flat View rebuild meter, which logs.
 //
 
 import Foundation
 import simd
+import os
 import ChapterScript
 
 public enum HeadsetStereoPresentation {
@@ -271,14 +288,149 @@ public enum HeadsetStereoPresentation {
     public static func leftEyeRegion(clipLayout: ChapterScript.VideoLayout,
                                      decidedLayout: ChapterScript.VideoLayout?,
                                      eyeOrder: StereoEyeOrder) -> EyeRegion {
-        let leftFirst = eyeOrder == .leftFirst
+        eyeRegion(.left, clipLayout: clipLayout, decidedLayout: decidedLayout,
+                  eyeOrder: eyeOrder, effectiveDisparity: 0)
+    }
+
+    // MARK: - Per eye (Convergence and frame packing)
+
+    /// One of the viewer's eyes, as the per-eye surface's camera index names
+    /// them.
+    public enum Eye: String, Sendable, CaseIterable {
+        case left, right
+    }
+
+    /// The total horizontal shift between the eyes, as a fraction of an
+    /// eye's width: the file's OWN disparity adjustment plus the author's
+    /// Convergence. The Mac's `SourceMediaInterpretation.effectiveDisparity`.
+    public static func effectiveDisparity(convergence: Float,
+                                          sourceDisparityAdjustment: Float = 0) -> Float {
+        sourceDisparityAdjustment + convergence
+    }
+
+    /// One eye's sampling shift, in units of that eye's own width. SPLIT
+    /// EVENLY, in opposite directions, so the panel's border does not move as
+    /// the author rides Convergence: pushing the scene farther moves the left
+    /// picture right (sampled from farther left) and the right picture left.
+    /// Mirrors `SourceMediaInterpretation.disparityShift(for:)`.
+    public static func disparityShift(_ eye: Eye, effectiveDisparity total: Float) -> Float {
+        guard total != 0 else { return 0 }
+        switch eye {
+        case .left:  return -total / 2
+        case .right: return  total / 2
+        }
+    }
+
+    /// WHERE ONE EYE'S PICTURE IS in the decoded frame (texture space, origin
+    /// top-left), Convergence included. Mirrors
+    /// `SourceMediaInterpretation.region(for:)`: the author's packing decision
+    /// outranks the clip's record, the eye order picks which half is which,
+    /// a mono or multiview frame is whole for each eye, and the shift may
+    /// carry the rectangle past the frame's edge (the surface samples black
+    /// there, as the Mac's crop does).
+    public static func eyeRegion(_ eye: Eye, clipLayout: ChapterScript.VideoLayout,
+                                 decidedLayout: ChapterScript.VideoLayout?,
+                                 eyeOrder: StereoEyeOrder,
+                                 effectiveDisparity: Float) -> EyeRegion {
+        let second: Eye = eyeOrder == .leftFirst ? .right : .left
+        let takesSecondHalf = eye == second
+        var region: EyeRegion
         switch decidedLayout ?? clipLayout {
         case .sideBySide:
-            return EyeRegion(x: leftFirst ? 0 : 0.5, y: 0, width: 0.5, height: 1)
+            region = EyeRegion(x: takesSecondHalf ? 0.5 : 0, y: 0, width: 0.5, height: 1)
         case .overUnder:
-            return EyeRegion(x: 0, y: leftFirst ? 0 : 0.5, width: 1, height: 0.5)
+            region = EyeRegion(x: 0, y: takesSecondHalf ? 0.5 : 0, width: 1, height: 0.5)
         case .mono, .multiviewHEVC:
-            return .whole
+            region = .whole
+        }
+        region.x += disparityShift(eye, effectiveDisparity: effectiveDisparity) * region.width
+        return region
+    }
+
+    /// How one eye samples: eye-local RealityKit texture coordinates (origin
+    /// BOTTOM-left, 0...1 over the panel) to frame coordinates, as
+    /// `uv * scale + offset`. The parameters the per-eye surface is handed.
+    public struct EyeSampling: Equatable, Sendable {
+        public var scale: SIMD2<Float>
+        public var offset: SIMD2<Float>
+
+        public init(scale: SIMD2<Float>, offset: SIMD2<Float>) {
+            self.scale = scale
+            self.offset = offset
+        }
+
+        public static let identity = EyeSampling(scale: SIMD2(1, 1), offset: .zero)
+
+        /// Where an eye-local coordinate samples the frame.
+        public func frameCoordinate(_ uv: SIMD2<Float>) -> SIMD2<Float> { uv * scale + offset }
+    }
+
+    /// A top-left region as a bottom-left sampling: u maps straight across;
+    /// v runs up, so the region's BOTTOM edge (`1 - y - height`) is where an
+    /// eye-local v of 0 lands.
+    public static func sampling(for region: EyeRegion) -> EyeSampling {
+        EyeSampling(scale: SIMD2(region.width, region.height),
+                    offset: SIMD2(region.x, 1 - region.y - region.height))
+    }
+
+    /// Everything the per-eye surface needs for one occurrence at one
+    /// instant.
+    public struct PanelEyeMapping: Equatable, Sendable {
+        public var left: EyeSampling
+        public var right: EyeSampling
+        /// True for a multiview file, whose eyes decode as TWO pictures: the
+        /// surface binds each eye's own. Otherwise both eyes sample one
+        /// decoded frame (frame-packed halves, or one mono picture).
+        public var picturesPerEye: Bool
+
+        public init(left: EyeSampling, right: EyeSampling, picturesPerEye: Bool) {
+            self.left = left
+            self.right = right
+            self.picturesPerEye = picturesPerEye
+        }
+
+        /// Both eyes see the same pixels: nothing per-eye to draw.
+        public var isMonoscopic: Bool { left == right && !picturesPerEye }
+    }
+
+    /// The per-eye mapping of a packing and an effective disparity.
+    public static func panelEyeMapping(clipLayout: ChapterScript.VideoLayout,
+                                       decidedLayout: ChapterScript.VideoLayout?,
+                                       eyeOrder: StereoEyeOrder,
+                                       effectiveDisparity: Float) -> PanelEyeMapping {
+        func eye(_ e: Eye) -> EyeSampling {
+            sampling(for: eyeRegion(e, clipLayout: clipLayout, decidedLayout: decidedLayout,
+                                    eyeOrder: eyeOrder, effectiveDisparity: effectiveDisparity))
+        }
+        return PanelEyeMapping(left: eye(.left), right: eye(.right),
+                               picturesPerEye: (decidedLayout ?? clipLayout) == .multiviewHEVC)
+    }
+
+    /// The occurrence's mapping at Sequence time `time`: its packing, and its
+    /// effective Convergence by THE one rule (`effectiveConvergence`) on top
+    /// of the file's own adjustment.
+    public static func panelEyeMapping(of occurrence: Occurrence, at time: TimeInterval,
+                                       sourceDisparityAdjustment: Float = 0) -> PanelEyeMapping {
+        panelEyeMapping(
+            clipLayout: occurrence.clipLayout, decidedLayout: occurrence.decidedLayout,
+            eyeOrder: occurrence.eyeOrder,
+            effectiveDisparity: effectiveDisparity(
+                convergence: effectiveConvergence(of: occurrence, at: time),
+                sourceDisparityAdjustment: sourceDisparityAdjustment))
+    }
+
+    /// Whether an occurrence needs the per-eye surface at all: a FRAME-PACKED
+    /// file (two pictures in one raster, which `VideoMaterial` shows whole to
+    /// both eyes), or any authored Convergence (a shift between the eyes). A
+    /// multiview file's views are already routed to their eyes by
+    /// `VideoMaterial`, and a mono clip has one picture, so either needs the
+    /// surface only for Convergence.
+    public static func needsPerEyeSurface(_ occurrence: Occurrence) -> Bool {
+        let convergenceAuthored = occurrence.baseConvergence != 0
+            || occurrence.stereoTracks.contains(where: \.hasAnyKeys)
+        switch occurrence.decidedLayout ?? occurrence.clipLayout {
+        case .sideBySide, .overUnder: return true
+        case .mono, .multiviewHEVC:   return convergenceAuthored
         }
     }
 
@@ -365,10 +517,28 @@ public enum HeadsetStereoPresentation {
     ///   its middle lies in 0...1 (cells own their vertices for exactly
     ///   this), so only a column of cells that straddles the seam samples
     ///   past the edge, and only by part of one cell.
+    ///
+    /// MEASURED. Every build is timed into `meter` (the shared
+    /// `flatViewRebuildMeter` by default), which logs the rebuild cost at
+    /// debug level once a second's worth of rebuilds (30, one per 33 ms tick
+    /// while a keyed aim moves) has accumulated. Pass nil to build unmeasured.
     public static func flatViewGrid(aim: VirtualCameraSpec, coverage: Coverage,
                                     region: EyeRegion = .whole,
                                     width: Float, height: Float,
-                                    columns: Int = 32, rows: Int = 24) -> FlatViewGrid {
+                                    columns: Int = 32, rows: Int = 24,
+                                    meter: FlatViewRebuildMeter? = HeadsetStereoPresentation.flatViewRebuildMeter) -> FlatViewGrid {
+        let started = ContinuousClock.now
+        let grid = unmeteredFlatViewGrid(aim: aim, coverage: coverage, region: region,
+                                         width: width, height: height,
+                                         columns: columns, rows: rows)
+        meter?.record(ContinuousClock.now - started)
+        return grid
+    }
+
+    private static func unmeteredFlatViewGrid(aim: VirtualCameraSpec, coverage: Coverage,
+                                              region: EyeRegion,
+                                              width: Float, height: Float,
+                                              columns: Int, rows: Int) -> FlatViewGrid {
         let cols = max(1, columns), rowCount = max(1, rows)
         let b = basis(aim: aim, outputAspect: Double(width / max(height, 0.0001)))
         let halfSpan = coverage.horizontalSpanRadians * 0.5
@@ -449,4 +619,89 @@ public enum HeadsetStereoPresentation {
         default: return false
         }
     }
+}
+
+// MARK: - Measuring the Flat View rebuild (OD-24)
+
+/// What rebuilding Flat View grids has cost, over a window of rebuilds.
+public struct FlatViewRebuildStats: Equatable, Sendable {
+    public var count: Int
+    public var totalSeconds: Double
+    public var maxSeconds: Double
+
+    public init(count: Int = 0, totalSeconds: Double = 0, maxSeconds: Double = 0) {
+        self.count = count
+        self.totalSeconds = totalSeconds
+        self.maxSeconds = maxSeconds
+    }
+
+    public var meanMilliseconds: Double { count == 0 ? 0 : totalSeconds / Double(count) * 1000 }
+    public var maxMilliseconds: Double { maxSeconds * 1000 }
+
+    mutating func add(_ seconds: Double) {
+        count += 1
+        totalSeconds += seconds
+        maxSeconds = max(maxSeconds, seconds)
+    }
+}
+
+/// THE FLAT VIEW REBUILD COST, measured where it is paid. A keyed aim
+/// rebuilds the panel's grid up to every 33 ms; this records each build and,
+/// every `reportEvery` builds, logs the window's mean and worst at DEBUG
+/// level (so it costs nothing in an ordinary log) and starts a new window.
+/// The lifetime totals stay readable for a test or a diagnostics export.
+///
+/// Thread-safe: the grid is pure and may be built off the main actor.
+public final class FlatViewRebuildMeter: Sendable {
+    private struct State: Sendable {
+        var window = FlatViewRebuildStats()
+        var lifetime = FlatViewRebuildStats()
+    }
+
+    public let reportEvery: Int
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "ChapterPlayer", category: "Stereo")
+
+    public init(reportEvery: Int = 30) {
+        self.reportEvery = max(1, reportEvery)
+    }
+
+    /// Record one rebuild. Returns the window's stats when this rebuild
+    /// closed a window (and was logged), else nil.
+    @discardableResult
+    public func record(_ duration: Duration) -> FlatViewRebuildStats? {
+        let parts = duration.components
+        return record(seconds: Double(parts.seconds) + Double(parts.attoseconds) * 1e-18)
+    }
+
+    @discardableResult
+    public func record(seconds: Double) -> FlatViewRebuildStats? {
+        let every = reportEvery
+        let closed: FlatViewRebuildStats? = state.withLock { state in
+            state.window.add(seconds)
+            state.lifetime.add(seconds)
+            guard state.window.count >= every else { return nil }
+            let window = state.window
+            state.window = FlatViewRebuildStats()
+            return window
+        }
+        if let closed {
+            let mean = closed.meanMilliseconds, worst = closed.maxMilliseconds
+            Self.logger.debug("[stereo] Flat View grid rebuilt \(closed.count) times: mean \(mean, format: .fixed(precision: 3)) ms, worst \(worst, format: .fixed(precision: 3)) ms")
+        }
+        return closed
+    }
+
+    /// Every rebuild since the meter was made (or last reset).
+    public var lifetime: FlatViewRebuildStats { state.withLock { $0.lifetime } }
+
+    public func reset() {
+        state.withLock { $0 = State() }
+    }
+}
+
+public extension HeadsetStereoPresentation {
+    /// The meter every Flat View build reports to unless told otherwise.
+    static let flatViewRebuildMeter = FlatViewRebuildMeter()
 }

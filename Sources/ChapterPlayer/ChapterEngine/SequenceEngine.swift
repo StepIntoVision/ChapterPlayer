@@ -426,7 +426,8 @@ public final class SequenceEngine {
         return await runSegmentsFrom(index: clampedStart, in: sequence)
     }
 
-    /// COUNT ONE ENTRY OF `sequence` (OD-97).
+    /// COUNT ONE ENTRY OF `sequence` (OD-97), after resetting what resets
+    /// there (OD-132).
     ///
     /// Every route into a Sequence passes through `play` or `playAndAwait`
     /// exactly once: a Go To, a Return (resumed or restarted), a Restart and
@@ -435,8 +436,13 @@ public final class SequenceEngine {
     /// ChapterScript's (`StoryStateDefinition.entryMutations`), shared with
     /// the Mac preview, and they go through the session's one Memory write
     /// path, so a story-condition Cue waiting on the count is re-asked.
+    ///
+    /// RESET FIRST (OD-132): a Memory set to "Each time this Sequence starts"
+    /// returns to its start value on every one of these entries, a Resume
+    /// and a Return included, before the entry is counted.
     private func countEntry(of sequence: SequenceDefinition) {
         guard let store = storyState, store.isSessionActive else { return }
+        store.resetForEntry(of: sequence.id)
         let definitions = store.ledger.snapshot.map { $0.definition }
         let mutations = StoryStateDefinition.entryMutations(enteringSequence: sequence.id,
                                                             in: definitions)
@@ -1639,9 +1645,17 @@ public final class SequenceEngine {
     /// Deliberately independent of segment context: it does not advance, pause,
     /// satisfy a gate or touch `currentSegmentIndex`. An interaction leaves the
     /// story exactly where it was.
-    public func performActions(_ actions: [SegmentAction]) {
+    ///
+    /// `then` runs once every action has been dispatched (an Area's Response
+    /// uses it to learn that a decision matched nothing, OD-125). It is not
+    /// called for an empty list.
+    public func performActions(_ actions: [SegmentAction],
+                               then completion: (@MainActor @Sendable () -> Void)? = nil) {
         guard !actions.isEmpty else { return }
-        Task { @MainActor in await self.executeActions(actions) }
+        Task { @MainActor in
+            await self.executeActions(actions)
+            completion?()
+        }
     }
 
     private func executeActions(_ actions: [SegmentAction]) async {

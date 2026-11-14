@@ -77,18 +77,20 @@ public final class StoryStateStore {
         onChange?()
     }
 
-    // MARK: - Resume (OD-98)
+    // MARK: - Resume (OD-98, retired for Memory by OD-132)
 
-    /// What the story remembers right now, for saving with a visit that is
-    /// being left (`SuspendedVisit.memorySnapshot`).
+    /// What the story remembers right now, handed to the navigator with a
+    /// visit that is being left (`SuspendedVisit.memorySnapshot`). OD-132:
+    /// nothing restores it any more; it is carried so the navigator's field
+    /// stays filled and decodable.
     public var memorySnapshot: StoryStateSnapshot { ledger.memorySnapshot }
 
-    /// PUT BACK THE MEMORY A RESUMED VISIT WAS LEFT WITH (OD-98). The owner's
-    /// rule: Resume restores the Memory snapshot saved when the visit was
-    /// left. Only states this session defines are written, with values of
-    /// their own kind (`StoryStateLedger.restore`); `keeping` names states
-    /// that are not rolled back. Tells anyone waiting, exactly as a mutation
-    /// does, so a Cue waiting on a fact sees the restored one.
+    /// PUT BACK A MEMORY SNAPSHOT. NOT CALLED BY PLAYBACK since OD-132: within
+    /// one play Memory is never rolled back by a jump back or a Resume. Kept
+    /// for a host restoring a session it owns. Only states this session
+    /// defines are written, with values of their own kind
+    /// (`StoryStateLedger.restore`); `keeping` names states that are not
+    /// rolled back. Tells anyone waiting, exactly as a mutation does.
     ///
     /// Not an authoring path, and not a session boundary: it neither begins
     /// nor ends a session, and does nothing outside one.
@@ -97,8 +99,25 @@ public final class StoryStateStore {
         let before = ledger.memorySnapshot
         ledger.restore(snapshot, keeping: keeping)
         guard ledger.memorySnapshot != before else { return }
-        logger.info("[story] Resume restored the Memory saved when the visit was left")
+        logger.info("[story] a saved Memory snapshot was restored")
         onChange?()
+    }
+
+    // MARK: - Reset on entry (OD-132)
+
+    /// AN ENTRY OF `sequenceId` BEGINS: every Memory set to "Each time this
+    /// Sequence starts" goes back to its start value, by ChapterScript's rule
+    /// (`StoryStateLedger.resetForEntry`), shared with the Mac preview. Tells
+    /// anyone waiting when something changed, as a mutation does. Does
+    /// nothing outside a session. Returns the ids that changed.
+    @discardableResult
+    public func resetForEntry(of sequenceId: String) -> [String] {
+        guard isSessionActive else { return [] }
+        let changed = ledger.resetForEntry(of: sequenceId)
+        guard !changed.isEmpty else { return [] }
+        logger.info("[story] entry of \(sequenceId, privacy: .public) reset \(changed.count) Memory item(s)")
+        onChange?()
+        return changed
     }
 
     // MARK: - Mutation

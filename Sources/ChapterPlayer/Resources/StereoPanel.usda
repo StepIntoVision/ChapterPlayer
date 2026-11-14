@@ -1,0 +1,134 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# THE PER-EYE PANEL SURFACE (OD-24), read by `StereoPanelMaterial`.
+#
+# Each eye samples its own rectangle of the decoded frame: eye-local texture
+# coordinates times <Eye>Scale plus <Eye>Offset (bottom-left origin), worked
+# out by `HeadsetStereoPresentation.panelEyeMapping` from the packing, the eye
+# order and the effective Convergence. The camera-index switch picks the
+# left or right sample per eye; a monoscopic view (a capture) sees the left.
+# Outside the frame the sample is opaque black, as the Mac's crop paints it.
+# Unlit and untone-mapped, like the Effect surface the panel otherwise uses.
+
+def Xform "Root"
+{
+    def Material "StereoPanel"
+    {
+        asset inputs:LeftPicture
+        asset inputs:RightPicture
+        float2 inputs:LeftScale = (1, 1)
+        float2 inputs:LeftOffset = (0, 0)
+        float2 inputs:RightScale = (1, 1)
+        float2 inputs:RightOffset = (0, 0)
+        float inputs:Opacity = 1
+        token outputs:mtlx:surface.connect = </Root/StereoPanel/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex
+
+        def Shader "UV"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            float2 outputs:out
+        }
+
+        def Shader "LeftScaled"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/StereoPanel/UV.outputs:out>
+            float2 inputs:in2.connect = </Root/StereoPanel.inputs:LeftScale>
+            float2 outputs:out
+        }
+
+        def Shader "LeftUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/StereoPanel/LeftScaled.outputs:out>
+            float2 inputs:in2.connect = </Root/StereoPanel.inputs:LeftOffset>
+            float2 outputs:out
+        }
+
+        def Shader "RightScaled"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/StereoPanel/UV.outputs:out>
+            float2 inputs:in2.connect = </Root/StereoPanel.inputs:RightScale>
+            float2 outputs:out
+        }
+
+        def Shader "RightUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/StereoPanel/RightScaled.outputs:out>
+            float2 inputs:in2.connect = </Root/StereoPanel.inputs:RightOffset>
+            float2 outputs:out
+        }
+
+        def Shader "LeftSample"
+        {
+            uniform token info:id = "ND_RealityKitTexture2D_color4"
+            asset inputs:file.connect = </Root/StereoPanel.inputs:LeftPicture>
+            float2 inputs:texcoord.connect = </Root/StereoPanel/LeftUV.outputs:out>
+            string inputs:u_wrap_mode = "clamp_to_border"
+            string inputs:v_wrap_mode = "clamp_to_border"
+            string inputs:border_color = "opaque_black"
+            color4f outputs:out
+        }
+
+        def Shader "RightSample"
+        {
+            uniform token info:id = "ND_RealityKitTexture2D_color4"
+            asset inputs:file.connect = </Root/StereoPanel.inputs:RightPicture>
+            float2 inputs:texcoord.connect = </Root/StereoPanel/RightUV.outputs:out>
+            string inputs:u_wrap_mode = "clamp_to_border"
+            string inputs:v_wrap_mode = "clamp_to_border"
+            string inputs:border_color = "opaque_black"
+            color4f outputs:out
+        }
+
+        def Shader "EyeSwitch"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_color4"
+            color4f inputs:mono.connect = </Root/StereoPanel/LeftSample.outputs:out>
+            color4f inputs:left.connect = </Root/StereoPanel/LeftSample.outputs:out>
+            color4f inputs:right.connect = </Root/StereoPanel/RightSample.outputs:out>
+            color4f outputs:out
+        }
+
+        def Shader "Color"
+        {
+            uniform token info:id = "ND_swizzle_color4_color3"
+            string inputs:channels = "rgb"
+            color4f inputs:in.connect = </Root/StereoPanel/EyeSwitch.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "Alpha"
+        {
+            uniform token info:id = "ND_swizzle_color4_float"
+            string inputs:channels = "a"
+            color4f inputs:in.connect = </Root/StereoPanel/EyeSwitch.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "FadedAlpha"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/StereoPanel/Alpha.outputs:out>
+            float inputs:in2.connect = </Root/StereoPanel.inputs:Opacity>
+            float outputs:out
+        }
+
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            bool inputs:applyPostProcessToneMap = 0
+            color3f inputs:color.connect = </Root/StereoPanel/Color.outputs:out>
+            float inputs:opacity.connect = </Root/StereoPanel/FadedAlpha.outputs:out>
+            token outputs:out
+        }
+    }
+}

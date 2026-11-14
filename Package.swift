@@ -25,7 +25,12 @@ let package = Package(
         .target(
             name: "ChapterPlayer",
             dependencies: ["ChapterScript"],
-            path: "Sources/ChapterPlayer"
+            path: "Sources/ChapterPlayer",
+            resources: [
+                // OD-24: the per-eye panel surface (`StereoPanelMaterial`).
+                // Copied, not processed: RealityKit reads the USDA itself.
+                .copy("Resources/StereoPanel.usda")
+            ]
         )
     ]
 )

@@ -867,12 +867,33 @@ open class ChapterPlayerCore {
         // There is no accessibility-specific Sequence change (Phase 6's rule).
         sequenceEngine.onNavigationRequested = { [weak self] intent in
             guard let self else { return }
-            self.startEngineNavigation("a Go To") {
+            // AN AREA RESPONSE'S GO TO (OD-125) waits for its answer before
+            // leaving the Area: if it moves nothing, the story continues past
+            // the Area instead, so the Area must still be there to let go.
+            let areaRegionId = self.claimPendingAreaGoTo()
+            let started = self.startEngineNavigation("a Go To") {
                 // EXPLICIT NAVIGATION LEAVES AN EXPLORE REGION IMMEDIATELY.
                 // Satisfying a Region's exit is a different act and does not
-                // come through here — see `docs/EXPERIENCE_FLOW.md` §6.
-                self.storyRegions.teardown()
-                await self.navigate(intent, source: .host)
+                // come through here — see `docs/EXPERIENCE_FLOW.md` §6. A move
+                // tears the Area down anyway (`SequenceEngine.stop`).
+                if areaRegionId == nil { self.storyRegions.teardown() }
+                let outcome = await self.navigateReportingOutcome(intent, source: .host)
+                guard let areaRegionId else { return }
+                switch outcome {
+                case .some(.refused(let refusal)):
+                    self.areaGoToDidNotMove(areaRegionId, why: refusal.message)
+                case .some(.stay):
+                    self.areaGoToDidNotMove(areaRegionId, why: "it stays where it is")
+                case .some(.enter), .some(.finish):
+                    if self.pendingAreaGoTo?.regionId == areaRegionId { self.pendingAreaGoTo = nil }
+                case .none:
+                    // A host Play won (OD-111): it decides where the story is.
+                    if self.pendingAreaGoTo?.regionId == areaRegionId { self.pendingAreaGoTo = nil }
+                }
+            }
+            // Dropped because another navigation holds the slot (OD-46).
+            if !started, let areaRegionId {
+                self.areaGoToDidNotMove(areaRegionId, why: "another navigation was under way")
             }
         }
 
@@ -1145,6 +1166,16 @@ open class ChapterPlayerCore {
     /// RUN AN AREA'S RESPONSE through the one engine path an Interaction's
     /// response takes. Empty is Continue, which the controller performs by
     /// letting the story go; nothing runs here for it.
+    ///
+    /// A GO TO THAT GOES NOWHERE IS SKIPPED (OD-125, owner decision). The
+    /// controller lets a Response that holds a Go To decide where the story
+    /// goes, and does not also continue past the Area. When that Go To moves
+    /// nothing (its Sequence is missing, the navigation is unsupported, a
+    /// decision matched nothing and has no Otherwise, or another navigation
+    /// holds the slot), the boundary is released here exactly as an empty
+    /// Response (Continue) releases it, so the story never waits forever.
+    /// Decided from what the navigation DID (`areaGoToDidNotMove`), never
+    /// from the Response's shape.
     private func runAreaResponse(_ region: StoryRegion) {
         let actions = region.responseActions.compactMap { dto -> SegmentAction? in
             do { return try SegmentAction(dto: dto) } catch {
@@ -1152,9 +1183,65 @@ open class ChapterPlayerCore {
                 return nil
             }
         }
-        guard !actions.isEmpty else { return }
+        let navigates = region.responseNavigates
+        guard !actions.isEmpty else {
+            // Nothing runnable: a Go To this build could not read is a Go To
+            // that moved nothing.
+            if navigates { areaGoToDidNotMove(region.id, why: "its Go To could not be read") }
+            return
+        }
         logger.info("[explore] Area '\(region.id)' runs its Response: \(actions.count) action(s)")
-        sequenceEngine.performActions(actions)
+        if navigates {
+            pendingAreaGoTo = PendingAreaGoTo(regionId: region.id)
+        }
+        let regionId = region.id
+        sequenceEngine.performActions(actions) { [weak self] in
+            self?.areaResponseDidRun(regionId)
+        }
+    }
+
+    /// OD-125: an Area Response holding a Go To, between running and the
+    /// navigation's answer. `requested` turns true when the engine hands the
+    /// Go To to the host (`onNavigationRequested`).
+    private struct PendingAreaGoTo {
+        let regionId: String
+        var requested = false
+    }
+    @ObservationIgnored private var pendingAreaGoTo: PendingAreaGoTo?
+
+    /// The Response's actions have all been dispatched. A Go To that was
+    /// never handed over (a decision that matched nothing and has no
+    /// Otherwise resolves to nothing inside the engine) moved nothing.
+    private func areaResponseDidRun(_ regionId: String) {
+        guard let pending = pendingAreaGoTo, pending.regionId == regionId,
+              !pending.requested else { return }
+        pendingAreaGoTo = nil
+        areaGoToDidNotMove(regionId, why: "its decision matched nothing")
+    }
+
+    /// The engine is handing over a Go To. When it is the pending Area
+    /// Response's, claim it: the Area's id comes back, and the navigation
+    /// reports to `areaGoToDidNotMove` if it moves nothing.
+    private func claimPendingAreaGoTo() -> String? {
+        guard var pending = pendingAreaGoTo, !pending.requested else { return nil }
+        pending.requested = true
+        pendingAreaGoTo = pending
+        return pending.regionId
+    }
+
+    /// THE AREA'S GO TO MOVED NOTHING: continue past the Area, as an empty
+    /// Response does (OD-125). Held at the Area's own boundary, the story is
+    /// let go by the same call a tap makes. Resolved during the first pass,
+    /// there is nothing to let go: the exit is already resolved, so the
+    /// engine does not wait when it reaches the boundary.
+    private func areaGoToDidNotMove(_ regionId: String, why: String) {
+        if pendingAreaGoTo?.regionId == regionId { pendingAreaGoTo = nil }
+        guard let runtime = storyRegions.active, runtime.region.id == regionId else { return }
+        logger.warning("[explore] Area '\(regionId)' Response's Go To moved nothing (\(why)); the story continues past the Area")
+        storyRegions.exitDidRelease()
+        if sequenceEngine.isWaiting, storyRegions.ownsActiveGateTiming {
+            sequenceEngine.satisfyGate()
+        }
     }
 
     /// What a looping Area is replaying, worked out once as its hold begins.
@@ -1938,28 +2025,18 @@ open class ChapterPlayerCore {
             // because entering is entering, and they differ in the VISIT the
             // navigator handed back.
             let startIndex = resumingFrom.map { segmentIndex(of: next, atAuthoredTime: $0) } ?? 0
-            // Read now: the navigator's answer belongs to the request that
-            // produced this outcome.
-            let memoryToRestore = resumingFrom != nil ? navigator.restoredMemorySnapshot : nil
             // A host Play that canceled this (engine) navigation while it
             // waited on the space or the scene has already won (OD-111):
             // nothing of this visit is recorded.
             guard await enterSequence(next, startingAtSegmentIndex: startIndex) else { return }
 
-            // RESUME RESTORES THE MEMORY THE VISIT WAS LEFT WITH (OD-98,
-            // owner decision). After the start, so the visit that was left
-            // is already stopped and cannot react to it, and before the
-            // resumed visit's segment loop first runs (its Task starts after
-            // this turn), so its Cues and branches read what the viewer had
-            // when they left. Entry counters are kept: a Return is an entry,
-            // and a counter counts the whole run. Only a Resume carries a
-            // snapshot; a Restart or a fresh visit leaves Memory as it stands.
-            if let memoryToRestore {
-                let counters = Set((currentDocumentForStyling()?.storyState ?? [])
-                    .filter { $0.countsEntriesOfSequenceId != nil }
-                    .map(\.id))
-                storyState.restore(memoryToRestore, keeping: counters)
-            }
+            // MEMORY IS NEVER ROLLED BACK WITHIN ONE PLAY (OD-132, owner
+            // decision; it retires OD-98's restore). A Resume or a jump back
+            // keeps every Memory as the viewer has made it, entry counters
+            // included; only stopping the Chapter resets it all, and a Memory
+            // set to "Each time a Sequence starts" resets on that Sequence's
+            // entries (`SequenceEngine.countEntry`). The navigator's
+            // `restoredMemorySnapshot` is deliberately not read.
 
             // ── WHAT A VISIT OWNS, RESTORED OR RE-ARMED ─────────────────────
             //
@@ -2002,11 +2079,22 @@ open class ChapterPlayerCore {
     /// Ask the navigator to do something, then do it.
     @MainActor
     public func navigate(_ intent: NavigationIntent, source: NavigationSource = .host) async {
+        _ = await navigateReportingOutcome(intent, source: source)
+    }
+
+    /// `navigate`, reporting what the navigator decided: `nil` when this
+    /// request was not carried out at all (a host Play canceled it, OD-111).
+    /// An Area Response's Go To reads it to continue past the Area when it
+    /// moves nothing (OD-125).
+    @MainActor
+    @discardableResult
+    private func navigateReportingOutcome(_ intent: NavigationIntent,
+                                          source: NavigationSource) async -> NavigationOutcome? {
         // A host's own request wins over an engine navigation in flight (OD-111).
         cancelEngineNavigationForHost()
         let counted = countNavigation()
         defer { if counted { navigationsInFlight -= 1 } }
-        guard mayProceed else { return }
+        guard mayProceed else { return nil }
         // `.start` IS THE BEGINNING OF A CHAPTER PLAYBACK SESSION. Seeding here
         // rather than inside the navigator keeps the navigator pure, and keeps
         // the one thing that resets Story State at the one place a Chapter
@@ -2021,9 +2109,10 @@ open class ChapterPlayerCore {
             // A BRANCH IS RESOLVED AGAINST THE RUNNING SESSION, by the shared
             // evaluator. Nothing here decides which case wins.
             storyState: storyState.ledger,
-            // OD-98: the Memory of the visit this request leaves goes with it.
+            // OD-98's field, still filled; OD-132: nothing restores it.
             memorySnapshot: storyState.memorySnapshot)
         await perform(outcome)
+        return outcome
     }
 
     /// BEGIN A CHAPTER PLAYBACK SESSION. Every Story State returns to its

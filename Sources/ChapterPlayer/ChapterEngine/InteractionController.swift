@@ -207,8 +207,12 @@ public final class InteractionController {
             // An Object with no definition has nothing to decorate or resolve.
             guard let entity = definitions[use.objectId] else { continue }
             ledger.register(use.interactions)
+            // Feedback belongs to this use of the Object (format 9, OD-128).
+            let feedback = Self.armedFeedback(forObject: entity.id, in: document,
+                                              sequenceId: sequenceId)
             for spec in use.interactions {
-                decorate(entity, interactions: use.interactions, target: spec.target)
+                decorate(entity, interactions: use.interactions, target: spec.target,
+                         feedback: feedback)
                 register(spec, on: entity.id)
             }
         }
@@ -248,6 +252,20 @@ public final class InteractionController {
             }
         }
         return merged
+    }
+
+    /// THE FEEDBACK ONE VISIT SHOWS FOR AN OBJECT (format 9, OD-128). Pure,
+    /// so it is the same answer on every host.
+    ///
+    /// With a Sequence: that Sequence's own Feedback for the Object, falling
+    /// back to a pre-format-9 Object-level value an unmigrated document still
+    /// carries, else Automatic. Without one (a host that has not wired
+    /// `playingSequenceProvider`): the first Sequence that sets one, else the
+    /// Object-level value. `ChapterDocument.interactionFeedback(onObject:inSequence:)`.
+    public static func armedFeedback(forObject objectId: String,
+                                     in document: ChapterDocument,
+                                     sequenceId: String?) -> InteractionFeedbackSpec {
+        document.interactionFeedback(onObject: objectId, inSequence: sequenceId)
     }
 
     /// Re-arm from `documentProvider`, for the playing Sequence. No-op when no
@@ -926,7 +944,8 @@ public final class InteractionController {
     /// suppress the semantic one.
     private func decorate(_ definition: EntityDefinition,
                           interactions: [InteractionSpec],
-                          target: SubElementTarget?) {
+                          target: SubElementTarget?,
+                          feedback: InteractionFeedbackSpec) {
         let key = target.map { $0.objectId + "\u{1f}" + $0.primPath }
             ?? definition.id
         guard decorated[key] == nil else { return }
@@ -941,7 +960,7 @@ public final class InteractionController {
         var record = DecorationRecord(ownerId: definition.id, target: target,
                                       addedInputTarget: false, addedCollision: false,
                                       addedHoverEffect: false, addedAccessibility: false,
-                                      feedback: definition.resolvedInteractionFeedback)
+                                      feedback: feedback)
 
         // Hit testing. Without a collision shape a tap and a hover have nothing
         // to land on — the entity is visible and inert.
@@ -961,7 +980,7 @@ public final class InteractionController {
         }
 
         // Visual affordance.
-        if let effect = hoverEffect(for: definition.resolvedInteractionFeedback) {
+        if let effect = hoverEffect(for: feedback) {
             if entity.components[HoverEffectComponent.self] == nil {
                 entity.components.set(effect)
                 record.addedHoverEffect = true

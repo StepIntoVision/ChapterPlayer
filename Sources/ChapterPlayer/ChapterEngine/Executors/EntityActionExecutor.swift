@@ -8,6 +8,14 @@
 //  (`MotionCurveSampling.actionProgress`, OD-52), not fired as RealityKit
 //  animations; see `applyActionTweens`.
 //
+//  ONE LAYER ORDER, THE EDITORS' (OD-52). Every frame: timed actions, then a
+//  legacy `animateMotion` (which the editors fold in with the actions), then
+//  the Sequence's animation tracks, then the motion behaviors composed onto
+//  whatever pose those produced, with their opacity MULTIPLIED onto the
+//  authored or faded opacity. The order and its arithmetic are ChapterScript's
+//  (`MotionCurveSampling.composing`, `legacyMotionSample`), the same functions
+//  MaestroKit's `ScrubCompositor` and the Mac compositor describe.
+//
 
 import RealityKit
 import OSLog
@@ -84,7 +92,30 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     ///
     /// nil when no authored clock was available at registration; the sampler
     /// then falls back to the old segment-relative behavior rather than freezing.
-    private var activeMotions: [String: (action: AnimateMotionAction, startedAt: TimeInterval?)] = [:]
+    private var activeMotions: [String: (action: AnimateMotionAction, startedAt: TimeInterval?, serial: Int)] = [:]
+
+    /// THE ACTION LAYER'S OWN POSE, per entity, in parent space (OD-52).
+    ///
+    /// What the timed actions (Move, Scale, a placing Reveal) and a legacy
+    /// `animateMotion` last set, BEFORE the motion layer composed anything onto
+    /// it. The behavior layer composes onto this for an unkeyed Object, as the
+    /// editors compose onto their action walk's pose; reading
+    /// `entity.transform` instead would fold the previous frame's offset back
+    /// in. Absent means the action layer has not moved the Object since its
+    /// rest was (re)applied, so the authored rest is the answer.
+    private var actionPoses: [String: Transform] = [:]
+
+    /// THE ACTION LAYER'S OWN OPACITY, per entity: what a Fade, a Reveal or a
+    /// Show last set, before a fading behavior multiplied onto it. Absent
+    /// means nothing has set one, and the entity's own opacity is read (once,
+    /// before the motion layer first writes it).
+    private var actionOpacities: [String: Float] = [:]
+
+    /// Execution order of the transform-writing actions, so a legacy
+    /// `animateMotion` and a Move on one Object resolve as the editors' time
+    /// walk does: the one that fired LATER wins.
+    private var actionSerial = 0
+    private var transformActionSerials: [String: Int] = [:]
 
     /// MOTION ACTIONS 2.0 — active behaviors per entity, MANY per entity
     /// (a Move In and a Scale In are two behaviors that compose), each with
@@ -130,6 +161,9 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         originalTransforms.removeValue(forKey: name)
         transformTweens.removeValue(forKey: name)
         opacityTweens.removeValue(forKey: name)
+        actionPoses.removeValue(forKey: name)
+        actionOpacities.removeValue(forKey: name)
+        transformActionSerials.removeValue(forKey: name)
     }
 
     /// Re-baseline the reset pose for `name` to a new AUTHORED transform.
@@ -141,6 +175,62 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     public func setOriginalTransform(_ transform: Transform, name: String) {
         guard originalTransforms[name] != nil else { return }
         originalTransforms[name] = transform
+        // The rest moved under the action layer: it starts again from there.
+        actionPoses.removeValue(forKey: name)
+    }
+
+    // MARK: - The action layer's state (OD-52)
+
+    /// The parent-space pose the action layer last set, else the authored
+    /// rest when the motion layer may have written over the rendered pose,
+    /// else the rendered pose (nothing but the action layer has touched it).
+    private func actionPose(for name: String, _ entity: Entity) -> Transform {
+        // A GRABBABLE OBJECT AT REST IS WHERE THE VIEWER PUT IT. A Reveal
+        // that allows grabbing adds ManipulationComponent, and nothing tells
+        // this layer when the viewer moves the Object by hand, so the cached
+        // pose went stale: a later Scale or offset Move started from where
+        // the Reveal placed it and the Object jumped back (round 4 review).
+        // With no tween and no motion behavior running, the rendered pose
+        // IS the action pose plus the viewer's grab; read it.
+        if entity.components[ManipulationComponent.self] != nil,
+           transformTweens[name] == nil, activeBehaviors[name] == nil,
+           !activeMotions.values.contains(where: { $0.action.entity == name }) {
+            return entity.transform
+        }
+        if let pose = actionPoses[name] { return pose }
+        if activeBehaviors[name] != nil, let rest = authoredRestTransform(for: name) { return rest }
+        return entity.transform
+    }
+
+    /// The opacity the action layer last set, else the entity's own.
+    private func actionOpacity(for name: String, _ entity: Entity) -> Float {
+        actionOpacities[name] ?? entity.opacity
+    }
+
+    /// Write an action-layer opacity and remember it as the base the motion
+    /// layer multiplies onto.
+    private func setActionOpacity(_ value: Float, on entity: Entity, name: String) {
+        actionOpacities[name] = value
+        entity.opacity = value
+    }
+
+    /// A parent-space pose expressed in world space.
+    private static func worldTransform(of local: Transform, in entity: Entity) -> Transform {
+        guard let parent = entity.parent else { return local }
+        return Transform(matrix: parent.transformMatrix(relativeTo: nil) * local.matrix)
+    }
+
+    /// A world-space pose expressed in the entity's parent space.
+    private static func localTransform(ofWorld world: Transform, in entity: Entity) -> Transform {
+        guard let parent = entity.parent else { return world }
+        return Transform(matrix: parent.transformMatrix(relativeTo: nil).inverse * world.matrix)
+    }
+
+    /// Record that a transform-writing action fired now, after everything
+    /// already in flight.
+    private func noteTransformAction(on name: String) {
+        actionSerial += 1
+        transformActionSerials[name] = actionSerial
     }
 
     public func showEntity(named name: String) {
@@ -158,6 +248,9 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         if let opacity = entity.components[OpacityComponent.self]?.opacity,
            opacity <= 0.001 {
             entity.components[OpacityComponent.self]?.opacity = 1
+        }
+        if let base = actionOpacities[name], base <= 0.001 {
+            actionOpacities[name] = 1
         }
         triggerParticleBurstIfNeeded(on: entity)
         logger.debug("Show entity: \(name)")
@@ -194,8 +287,11 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         if let headOffset = action.headRelativePosition {
             let worldTarget = resolveHeadWorldPosition(offset: headOffset, headYOnly: action.headYOnly)
 
-            var targetScale = entity.scale(relativeTo: nil)
-            var targetRotation = entity.orientation(relativeTo: nil)
+            // From the ACTION pose, not the rendered one: a Slow Spin or a
+            // Pulse composed on top must not be baked into the Move's target.
+            let current = Self.worldTransform(of: actionPose(for: action.entity, entity), in: entity)
+            var targetScale = current.scale
+            var targetRotation = current.rotation
 
             if let multiplier = action.scaleMultiplier {
                 targetScale *= multiplier
@@ -222,15 +318,18 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                                     world: true, duration: action.duration,
                                     timing: canonicalTiming) {
                 entity.move(to: targetTransform, relativeTo: nil, duration: action.duration, timingFunction: timing)
+                actionPoses[action.entity] = Self.localTransform(ofWorld: targetTransform, in: entity)
+                noteTransformAction(on: action.entity)
             }
 
             let mode = action.headYOnly ? "headYOnly" : "headRelative"
             logger.debug("Move entity (\(mode)): \(action.entity) offset=\(headOffset) → world=\(worldTarget)")
         } else {
-            // Parent-space positioning
-            var targetPosition = entity.position(relativeTo: entity.parent)
-            var targetScale = entity.scale
-            var targetRotation = entity.orientation
+            // Parent-space positioning, from the ACTION pose.
+            let current = actionPose(for: action.entity, entity)
+            var targetPosition = current.translation
+            var targetScale = current.scale
+            var targetRotation = current.rotation
 
             if let offset = action.positionOffset {
                 targetPosition += offset
@@ -260,6 +359,8 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                                     world: false, duration: action.duration,
                                     timing: canonicalTiming) {
                 entity.move(to: targetTransform, relativeTo: entity.parent, duration: action.duration, timingFunction: timing)
+                actionPoses[action.entity] = targetTransform
+                noteTransformAction(on: action.entity)
             }
 
             logger.debug("Move entity: \(action.entity) over \(String(format: "%.1f", action.duration))s")
@@ -272,10 +373,11 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             return
         }
 
+        let current = actionPose(for: name, entity)
         let targetTransform = Transform(
-            scale: entity.scale * multiplier,
-            rotation: entity.orientation,
-            translation: entity.position(relativeTo: entity.parent)
+            scale: current.scale * multiplier,
+            rotation: current.rotation,
+            translation: current.translation
         )
 
         if !startTransformTween(on: entity, name: name, to: targetTransform, world: false,
@@ -286,6 +388,8 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                 duration: duration,
                 timingFunction: timing.animationTimingFunction
             )
+            actionPoses[name] = targetTransform
+            noteTransformAction(on: name)
         }
 
         logger.debug("Scale entity: \(name) by \(multiplier)× over \(String(format: "%.1f", duration))s")
@@ -300,6 +404,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                               duration: action.duration,
                               timing: Self.canonicalTiming(action.timing)) {
             entity.fadeOpacity(to: action.opacity, duration: action.duration, timing: action.timing.animationTimingFunction)
+            actionOpacities[action.entity] = action.opacity
         }
         logger.debug("Fade entity: \(action.entity) to opacity \(action.opacity) over \(String(format: "%.1f", action.duration))s")
     }
@@ -312,38 +417,45 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
 
         // 1. Snap invisible (synchronous — no frame rendered between this and enable)
         opacityTweens.removeValue(forKey: action.entity)
-        entity.fadeOpacity(to: 0, duration: 0)
+        setActionOpacity(0, on: entity, name: action.entity)
         // A Reveal that PLACES the entity ends any Move still in flight on it,
         // or the next frame's sample would carry it off the placement.
         if action.headRelativePosition != nil || action.position != nil || action.scale != nil {
             transformTweens.removeValue(forKey: action.entity)
         }
 
-        // 2. Position
+        // 2. Position, ASSIGNED from the action pose (the motion layer's
+        //    offsets are not the Object's placement). Assigned rather than
+        //    `move(to:duration: 0)`, which goes through the animation system
+        //    and does nothing for an entity outside a scene, as
+        //    `resetAllEntities` explains.
         if let headOffset = action.headRelativePosition {
             let worldTarget = resolveHeadWorldPosition(offset: headOffset, headYOnly: action.headYOnly)
-            var targetScale = entity.scale(relativeTo: nil)
+            let current = Self.worldTransform(of: actionPose(for: action.entity, entity), in: entity)
+            var targetScale = current.scale
             if let scale = action.scale { targetScale = scale }
             let targetTransform = Transform(
                 scale: targetScale,
-                rotation: entity.orientation(relativeTo: nil),
+                rotation: current.rotation,
                 translation: worldTarget
             )
-            entity.move(to: targetTransform, relativeTo: nil, duration: 0)
+            Self.write(targetTransform, to: entity, world: true)
         } else if let position = action.position {
-            var targetScale = entity.scale
-            if let scale = action.scale { targetScale = scale }
-            let targetTransform = Transform(
-                scale: targetScale,
-                rotation: entity.orientation,
-                translation: position
-            )
-            entity.move(to: targetTransform, relativeTo: entity.parent, duration: 0)
+            var target = actionPose(for: action.entity, entity)
+            target.translation = position
+            if let scale = action.scale { target.scale = scale }
+            Self.write(target, to: entity, world: false)
         }
 
         // 3. Scale (only if not already applied in position block above)
         if let scale = action.scale, action.headRelativePosition == nil, action.position == nil {
-            entity.scale = scale
+            var target = actionPose(for: action.entity, entity)
+            target.scale = scale
+            Self.write(target, to: entity, world: false)
+        }
+        if action.headRelativePosition != nil || action.position != nil || action.scale != nil {
+            actionPoses[action.entity] = entity.transform
+            noteTransformAction(on: action.entity)
         }
 
         // 4. Enable (still invisible — opacity 0)
@@ -356,6 +468,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                               duration: action.fadeIn,
                               timing: MotionCurveSampling.revealTiming) {
             entity.fadeOpacity(to: 1.0, duration: action.fadeIn)
+            actionOpacities[action.entity] = 1
         }
 
         // 6. Optional hand manipulation — make the entity grabbable /
@@ -429,6 +542,8 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             // pose by definition, and it is what `applyRestPlacements` two
             // methods below has always done. One restore, one mechanism.
             entity.transform = restTransform
+            actionPoses.removeValue(forKey: name)
+            actionOpacities.removeValue(forKey: name)
             if entity.components.has(OpacityComponent.self) {
                 entity.opacity = 1.0
             }
@@ -494,14 +609,18 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         if duration <= MotionProgress.minimumDuration {
             transformTweens.removeValue(forKey: name)
             Self.write(target, to: entity, world: world)
+            actionPoses[name] = entity.transform
+            noteTransformAction(on: name)
             return true
         }
         guard let now = animationClock?() else { return false }
-        let from = world
-            ? Transform(matrix: entity.transformMatrix(relativeTo: nil))
-            : entity.transform
+        // FROM THE ACTION POSE, never the rendered one, which carries the
+        // motion layer's offset of the last frame.
+        let local = actionPose(for: name, entity)
+        let from = world ? Self.worldTransform(of: local, in: entity) : local
         transformTweens[name] = TransformTween(startedAt: now, duration: duration, timing: timing,
                                                from: from, to: target, world: world)
+        noteTransformAction(on: name)
         return true
     }
 
@@ -514,12 +633,12 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     ) -> Bool {
         if duration <= MotionProgress.minimumDuration {
             opacityTweens.removeValue(forKey: name)
-            entity.opacity = target
+            setActionOpacity(target, on: entity, name: name)
             return true
         }
         guard let now = animationClock?() else { return false }
         opacityTweens[name] = OpacityTween(startedAt: now, duration: duration, timing: timing,
-                                           from: entity.opacity, to: target)
+                                           from: actionOpacity(for: name, entity), to: target)
         return true
     }
 
@@ -557,6 +676,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                 progress: progress)
             Self.write(Transform(scale: pose.scale, rotation: pose.rotation, translation: pose.position),
                        to: entity, world: tween.world)
+            actionPoses[name] = entity.transform
             if done { transformTweens.removeValue(forKey: name) }
         }
         for (name, tween) in opacityTweens {
@@ -569,8 +689,9 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                                                             duration: tween.duration)
             let progress = done ? 1 : MotionCurveSampling.actionProgress(
                 startTime: tween.startedAt, now: now, duration: tween.duration, timing: tween.timing)
-            entity.opacity = MotionCurveSampling.interpolatedOpacity(from: tween.from, to: tween.to,
-                                                                     progress: progress)
+            setActionOpacity(MotionCurveSampling.interpolatedOpacity(from: tween.from, to: tween.to,
+                                                                     progress: progress),
+                             on: entity, name: name)
             if done { opacityTweens.removeValue(forKey: name) }
         }
     }
@@ -592,7 +713,8 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         }
         // Stamp the authored clock NOW, so progress is measured from when this
         // motion actually started rather than from whenever its segment did.
-        activeMotions[action.entity] = (action, animationClock?())
+        actionSerial += 1
+        activeMotions[action.entity] = (action, animationClock?(), actionSerial)
         logger.debug("beginMotion: \(action.entity) (duration \(action.duration)s)")
     }
 
@@ -606,6 +728,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         // carry the entity straight off it on the next frame.
         transformTweens.removeAll(keepingCapacity: true)
         opacityTweens.removeAll(keepingCapacity: true)
+        transformActionSerials.removeAll(keepingCapacity: true)
     }
 
     /// A SEGMENT BOUNDARY ENDS A LEGACY MOTION AND DOES NOT END A BEHAVIOR.
@@ -669,12 +792,28 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     /// MOTION ACTIONS 2.0 — compose every active behavior onto the pose the
     /// authored layers just produced.
     ///
-    /// Runs AFTER `applySequenceAnimationTracks()` on purpose: the track (or,
-    /// for an unkeyed entity, the registered rest transform) is the base, and
-    /// a behavior only ever ADDS to it. The base is read from AUTHORED state —
-    /// the animation track or `originalTransforms` — never from the entity's
-    /// current on-screen transform, which would fold the previous frame's
-    /// offset back in and make the object walk away over time.
+    /// Runs AFTER the action layer and `applySequenceAnimationTracks()` on
+    /// purpose: the base is what those produced, and a behavior only ever
+    /// ADDS to it. The base is read from AUTHORED state, never from the
+    /// entity's current on-screen transform, which would fold the previous
+    /// frame's offset back in and make the object walk away over time:
+    ///
+    ///   a KEYED Object    the pose its track wrote THIS frame;
+    ///   an UNKEYED one    the action layer's pose (`actionPoses`: where a
+    ///                     Move, a Scale, a placing Reveal or a legacy motion
+    ///                     put it), else its authored rest.
+    ///
+    /// That is the editors' rule (`ScrubCompositor`, the Mac compositor): the
+    /// offset composes onto the post-action, post-track pose. Before OD-52 an
+    /// unkeyed Object's behaviors composed onto its REST, so a Float on a
+    /// moved Object snapped it back to where it started.
+    ///
+    /// OPACITY MULTIPLIES, AND ONLY A FADING BEHAVIOR TOUCHES IT (VRT-10). A
+    /// behavior's opacity multiplier goes onto the authored or faded opacity
+    /// (the track's, when it keys opacity, else the action layer's), as in
+    /// the editors; it used to REPLACE it, so an Object faded to 0.3 popped
+    /// to full opacity when an entrance finished, and a Float with no fade
+    /// still removed the `OpacityComponent` a Fade had set.
     private func applyActiveBehaviors() {
         guard !activeBehaviors.isEmpty else { return }
         let authoredNow = animationClock?()
@@ -691,24 +830,19 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
 
         for (name, entries) in activeBehaviors {
             guard let entity = entityRegistry[name] else { continue }
-            // The authored base: whatever the track/rest layer produced. For a
-            // keyed entity `applySequenceAnimationTracks` has just written it;
-            // for an unkeyed one it is the registered rest transform.
-            //
             // RESOLVED BEFORE the behaviors rather than after: an orbit is
-            // defined by its center, so the resolver needs to know where the
-            // object sits.
-            // THE KEYED BRANCH READS `entity.transform` ONLY BECAUSE
-            // `applySequenceAnimationTracks` WROTE IT THIS FRAME — that pass
-            // bails out when there is no clock, and without this guard the read
-            // silently became the PREVIOUS frame's composed pose, folding each
-            // frame's offset back into the next one. That is the "walk away
-            // over time" this method's own header warns about.
-            let trackWroteThisFrame = authoredNow != nil
-                && sequenceAnimationTracks.contains { $0.entity == name }
+            // defined by its center and a center entrance by the vector to
+            // the origin, so the resolver needs to know where the object sits.
+            //
+            // THE KEYED BRANCH READS `entity.transform` ONLY BECAUSE THE TRACK
+            // PASS WROTE IT THIS FRAME (`trackPosedThisFrame`); that pass bails
+            // out when there is no clock, and reading it then would be the
+            // PREVIOUS frame's composed pose.
             let resolvedBase: Transform
-            if trackWroteThisFrame {
+            if trackPosedThisFrame.contains(name) {
                 resolvedBase = entity.transform
+            } else if let pose = actionPoses[name] {
+                resolvedBase = pose
             } else if let rest = authoredRestTransform(for: name) {
                 // The Sequence-local placement when there is one: a behavior on
                 // a locally-staged object used to compose onto the
@@ -717,81 +851,93 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             } else {
                 continue
             }
-            let restForMotion = resolvedBase.translation
 
             var combined = ChapterScript.MotionOffset.identity
+            var fades = false
             for (behavior, startedAt) in entries {
                 let progress: Float
                 if let startedAt, let authoredNow {
-                    // AN AMBIENT BEHAVIOR IS NOT A RAMP. `MotionProgress`
-                    // clamps at 1, which is right for an entrance and would
-                    // freeze a cycling cue after one period, so an ambient
-                    // behavior is handed ELAPSED CYCLES instead and the
-                    // resolver takes the phase modulo one.
-                    if behavior.kind == .ambient {
-                        // Elapsed CYCLES. The resolver takes the phase modulo
-                        // one and returns identity once the authored span has
-                        // run out, so a trimmed cue stops rather than freezing
-                        // mid-phase.
-                        let period = max(ChapterScript.MotionProgress.minimumDuration,
-                                         behavior.duration)
-                        progress = Float((authoredNow - startedAt) / period)
-                    } else {
-                        progress = ChapterScript.MotionProgress.progress(
-                            startTime: startedAt, now: authoredNow, duration: behavior.duration)
-                    }
+                    // AN AMBIENT BEHAVIOR IS NOT A RAMP: it is handed ELAPSED
+                    // CYCLES, and the resolver takes the phase modulo one and
+                    // returns identity once the authored span has run out.
+                    progress = MotionCurveSampling.behaviorProgress(
+                        behavior, startTime: startedAt, now: authoredNow)
                 } else {
                     // With no authored clock an ambient behavior sits at its
                     // authored pose rather than at some arbitrary point in a
                     // cycle it cannot measure.
                     progress = behavior.kind == .ambient ? 0 : 1
                 }
+                if MotionCurveSampling.animatesOpacity(behavior) { fades = true }
                 combined = ChapterScript.MotionOffset.combine(
                     combined,
                     ChapterScript.MotionBehaviorResolver.offset(
                         behavior, progress: progress, viewerYaw: viewerYaw,
-                        restPosition: restForMotion)
+                        restPosition: resolvedBase.translation)
                 )
             }
 
-            let base = resolvedBase
-
-            entity.position = base.translation + combined.positionDelta
-            entity.scale = base.scale * combined.scaleMultiplier
-            // ROTATION COMPOSES ON TOP OF THE AUTHORED ORIENTATION, in the
-            // entity's own space, so a Slow Spin turns an object about its own
-            // up axis wherever the author aimed it. Skipped entirely when
-            // there is none, so nothing that does not spin pays for a
-            // quaternion multiply every frame.
-            if combined.rotationDelta != .zero {
-                let radians = combined.rotationDelta * (.pi / 180)
-                let spin = simd_quatf(angle: radians.y, axis: [0, 1, 0])
-                    * simd_quatf(angle: radians.x, axis: [1, 0, 0])
-                    * simd_quatf(angle: radians.z, axis: [0, 0, 1])
-                entity.orientation = base.rotation * spin
-            } else {
-                entity.orientation = base.rotation
+            // The opacity the multiplier goes onto, read only when a behavior
+            // fades. Captured from the entity ONCE, before this layer first
+            // writes it, so later frames never read their own output back.
+            var baseOpacity: Float = 1
+            if fades {
+                if let keyed = trackOpacitiesThisFrame[name] {
+                    baseOpacity = keyed
+                } else if let authored = actionOpacities[name] {
+                    baseOpacity = authored
+                } else {
+                    baseOpacity = entity.opacity
+                    actionOpacities[name] = baseOpacity
+                }
             }
-            if combined.opacityMultiplier < 0.999 {
-                entity.components.set(OpacityComponent(opacity: combined.opacityMultiplier))
-            } else if entity.components.has(OpacityComponent.self) {
-                entity.components.remove(OpacityComponent.self)
+
+            let drawn = MotionCurveSampling.composing(
+                combined,
+                onto: (resolvedBase.translation, resolvedBase.rotation, resolvedBase.scale),
+                opacity: baseOpacity)
+            entity.position = drawn.position
+            entity.scale = drawn.scale
+            entity.orientation = drawn.rotation
+            if fades {
+                if drawn.opacity < 0.999 {
+                    entity.components.set(OpacityComponent(opacity: drawn.opacity))
+                } else if entity.components.has(OpacityComponent.self) {
+                    entity.components.remove(OpacityComponent.self)
+                }
             }
         }
     }
 
     public func applyActiveMotions(segmentElapsed: TimeInterval, totalElapsed: TimeInterval) {
-        // Order is the editors' order (`ScrubCompositor`, the Mac compositor):
-        // timed actions, then the tracks that override them, then the motion
-        // layer on top.
+        // THE EDITORS' ORDER (`ScrubCompositor`, the Mac compositor): timed
+        // actions and a legacy `animateMotion`, then the tracks that override
+        // them, then the motion layer on top of whatever those produced.
         applyActionTweens()
+        applyLegacyMotions(segmentElapsed: segmentElapsed, totalElapsed: totalElapsed)
         applySequenceAnimationTracks()
         applyActiveBehaviors()
+    }
+
+    /// A LEGACY `animateMotion`, written as part of the ACTION layer: before
+    /// the tracks and the behaviors, as the editors fold it in with the other
+    /// timed actions. It used to run LAST, so it overwrote both, and a Float
+    /// on an Object with an `animateMotion` did nothing on the headset while
+    /// the editors drew it.
+    ///
+    /// It writes only the channels it authors (`legacyMotionSample`), onto
+    /// the action pose, never onto the rendered one. A Move, Scale or placing
+    /// Reveal that fired AFTER it on the same Object wins, as a later action
+    /// does in the editors' time walk.
+    private func applyLegacyMotions(segmentElapsed: TimeInterval, totalElapsed: TimeInterval) {
         guard !activeMotions.isEmpty else { return }
-        let absoluteTime = Float(totalElapsed)
         let authoredNow = animationClock?()
-        for (action, startedAt) in activeMotions.values {
-            guard let entity = entityRegistry[action.entity], entity.isEnabled else { continue }
+        // Sequence seconds on the authored clock, as the editors pass it
+        // (oscillate's phase); the engine's elapsed time only without one.
+        let absoluteTime = Float(authoredNow ?? totalElapsed)
+        for (action, startedAt, serial) in activeMotions.values {
+            guard let entity = entityRegistry[action.entity] else { continue }
+            if let later = transformActionSerials[action.entity], later > serial { continue }
             // Measured from the MOTION's own start on the authored clock — the
             // same rule `ScrubCompositor` uses, so the editor and the headset
             // draw the same frame. Falls back to the legacy segment-relative
@@ -806,30 +952,24 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                                                    now: segmentElapsed,
                                                    duration: action.duration)
             }
-
-            if let positionCurve = action.position {
-                entity.position = MotionCurveEvaluator.evaluate(
-                    positionCurve, t: progress, absoluteTime: absoluteTime
-                )
-            }
-            if let scaleCurve = action.scale {
-                entity.scale = MotionCurveEvaluator.evaluate(
-                    scaleCurve, t: progress, absoluteTime: absoluteTime
-                )
-            }
-            if let rotationCurve = action.rotation {
-                let axisAngle = MotionCurveEvaluator.evaluate(
-                    rotationCurve, t: progress, absoluteTime: absoluteTime
-                )
-                let angle = simd_length(axisAngle)
-                if angle > 0 {
-                    entity.orientation = simd_quatf(angle: angle, axis: axisAngle / angle)
-                } else {
-                    entity.orientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
-                }
-            }
+            let sample = MotionCurveSampling.legacyMotionSample(
+                position: action.position, rotation: action.rotation, scale: action.scale,
+                progress: progress, absoluteTime: absoluteTime)
+            if sample.isEmpty { continue }
+            var pose = actionPose(for: action.entity, entity)
+            if let position = sample.position { pose.translation = position }
+            if let rotation = sample.rotation { pose.rotation = rotation }
+            if let scale = sample.scale { pose.scale = scale }
+            entity.transform = pose
+            actionPoses[action.entity] = pose
         }
     }
+
+    /// Which Objects the track pass posed THIS frame, and the opacity it
+    /// wrote for those whose track keys opacity: the motion layer's base.
+    /// Rebuilt every frame, kept for its capacity.
+    private var trackPosedThisFrame: Set<String> = []
+    private var trackOpacitiesThisFrame: [String: Float] = [:]
 
     /// Sample every sequence track at the authored sequence time and write the
     /// poses. Runs even for disabled entities so a reveal mid-curve finds
@@ -846,6 +986,8 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     public var animationLoopOverrides: [String: Double] = [:]
 
     private func applySequenceAnimationTracks() {
+        trackPosedThisFrame.removeAll(keepingCapacity: true)
+        trackOpacitiesThisFrame.removeAll(keepingCapacity: true)
         guard !sequenceAnimationTracks.isEmpty, let clock = animationClock else { return }
         let time = clock()
         for track in sequenceAnimationTracks {
@@ -861,8 +1003,10 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                 vector: SIMD4(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w)
             )
             entity.scale = SIMD3(pose.scale.x, pose.scale.y, pose.scale.z)
+            trackPosedThisFrame.insert(track.entity)
             if let opacity = pose.opacity {
                 entity.components.set(OpacityComponent(opacity: opacity))
+                trackOpacitiesThisFrame[track.entity] = opacity
             }
         }
     }
@@ -883,11 +1027,13 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         for name in sequenceRestOverrides.keys where placements[name] == nil {
             if let original = originalTransforms[name], let entity = entityRegistry[name] {
                 entity.transform = original
+                actionPoses.removeValue(forKey: name)
             }
         }
         sequenceRestOverrides = placements
         for (name, data) in placements {
             guard let entity = entityRegistry[name] else { continue }
+            actionPoses.removeValue(forKey: name)
             entity.transform = Transform(
                 scale: SIMD3(data.scale.x, data.scale.y, data.scale.z),
                 rotation: simd_quatf(vector: SIMD4(
@@ -905,6 +1051,9 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     /// `nil` clears the placement (the Chapter rest applies again).
     public func setRestPlacement(_ placement: TransformData?, for name: String) {
         sequenceRestOverrides[name] = placement
+        // The host moved the Object itself: the action layer starts again
+        // from the new placement rather than pulling it back.
+        actionPoses.removeValue(forKey: name)
     }
 
     /// THE AUTHORED REST — this Sequence's local placement when it has one,
