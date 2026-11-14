@@ -90,6 +90,19 @@ public final class StoryRegionController {
     @ObservationIgnored public var setAnimationLoopOverride:
         ((_ entity: String, _ sampleTime: Double?) -> Void)?
 
+    /// EXIT DETECTION STARTS AT AREA ENTRY (OD-23). Called once when the
+    /// story enters an Area whose exit is still open, so the host can start
+    /// sensing the exit's act (facing, approach, grab) and publish its
+    /// accessible equivalent while the first pass plays. An early act counts:
+    /// it resolves the Area through `offerEarlyExit` or `resolveActiveRegion`.
+    @ObservationIgnored public var exitWatchDidBegin: ((StoryRegion) -> Void)?
+
+    /// The early exit watch is over: the Area resolved, the story reached its
+    /// boundary (where the exit is an ordinary waiting Cue with its own
+    /// detection), or the visit left the Area. Called exactly once per
+    /// `exitWatchDidBegin`.
+    @ObservationIgnored public var exitWatchDidEnd: (() -> Void)?
+
     /// When a continuation is applied, and why.
     public enum ContinuationPhase: Sendable, Equatable {
         /// The authored first pass reached the boundary and the story is now
@@ -120,6 +133,8 @@ public final class StoryRegionController {
     /// The active region has let the story go. Once per region execution:
     /// the tick after a release must not release again.
     @ObservationIgnored private var didRelease = false
+    /// The early exit watch for the active Area is running.
+    @ObservationIgnored private var exitWatchActive = false
 
     public init() {}
 
@@ -136,6 +151,7 @@ public final class StoryRegionController {
 
     /// End of visit. Every transient fact goes; nothing here was ever authored.
     public func teardown() {
+        endExitWatch()
         endHoldIfNeeded()
         clearLoopOverrides()
         regions = []
@@ -174,6 +190,10 @@ public final class StoryRegionController {
         }
 
         let phase = runtime.phase(authoredTime: authored)
+
+        // At the boundary the exit is the waiting Cue, which senses for
+        // itself; once resolved there is nothing left to sense.
+        if phase != .firstPass { endExitWatch() }
 
         // ENTERING THE HOLD: the authored first pass has reached the boundary
         // with the exit unresolved.
@@ -223,6 +243,13 @@ public final class StoryRegionController {
         }
 
         active = runtime
+
+        // EXIT DETECTION FROM AREA ENTRY (OD-23): while the first pass plays,
+        // the viewer may already act. Started once, and only while the exit
+        // is still open. After `active` is stored, so a host that answers at
+        // once resolves the stored runtime rather than one this tick then
+        // overwrites.
+        if phase == .firstPass { beginExitWatchIfNeeded(runtime.region) }
     }
 
     /// The viewer satisfied the exit — a tap, a facing dwell, an approach, a
@@ -236,7 +263,27 @@ public final class StoryRegionController {
         guard runtime.resolution == nil else { return }
         runtime.resolve(.exitCondition, atRuntimeTime: now)
         active = runtime
+        endExitWatch()
         logger.info("Explore exit satisfied for '\(runtime.region.id)'")
+    }
+
+    /// AN ACT DURING THE FIRST PASS (OD-23). The viewer tapped, or used the
+    /// accessible equivalent, before the story reached the Area's boundary.
+    /// When the act is the one the exit asks for (judged by
+    /// `StoryRegionRuntime.acceptsEarlyExit`, which defers to
+    /// `GateActivation`), the Area resolves now and the story will not stall
+    /// at its end. Nothing in the first pass is skipped.
+    ///
+    /// Returns true when this act finished the Area.
+    @discardableResult
+    public func offerEarlyExit(_ activation: SemanticActivation,
+                               state: some StoryStateReading) -> Bool {
+        guard let runtime = active, let authored = authoredClock?(),
+              runtime.acceptsEarlyExit(activation, authoredTime: authored, state: state)
+        else { return false }
+        resolveActiveRegion()
+        logger.info("Explore exit satisfied early, during the first pass of '\(runtime.region.id)'")
+        return true
     }
 
     /// Playback left the region for a reason outside its own rules.
@@ -244,6 +291,7 @@ public final class StoryRegionController {
         guard var runtime = active, let now = runtimeClock?() else { return }
         runtime.resolve(.interrupted, atRuntimeTime: now)
         active = runtime
+        endExitWatch()
         clearLoopOverrides()
         endHoldIfNeeded()
     }
@@ -254,6 +302,7 @@ public final class StoryRegionController {
     /// boundary uses `boundaryDidPass(at:)`, which completes a region only at
     /// its own end.
     public func regionDidComplete() {
+        endExitWatch()
         endHoldIfNeeded()
         clearLoopOverrides()
         active = nil
@@ -386,6 +435,20 @@ public final class StoryRegionController {
         guard !didRelease else { return }
         didRelease = true
         releaseStory?()
+    }
+
+    /// Start the early exit watch for `region`, once per Area execution.
+    private func beginExitWatchIfNeeded(_ region: StoryRegion) {
+        guard !exitWatchActive, active?.resolution == nil else { return }
+        exitWatchActive = true
+        exitWatchDidBegin?(region)
+    }
+
+    /// Stop the early exit watch, telling the host exactly once.
+    private func endExitWatch() {
+        guard exitWatchActive else { return }
+        exitWatchActive = false
+        exitWatchDidEnd?()
     }
 
     /// Leave the held state, telling the host exactly once.

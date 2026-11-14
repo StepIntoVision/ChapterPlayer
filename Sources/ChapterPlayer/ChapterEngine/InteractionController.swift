@@ -216,6 +216,11 @@ public final class InteractionController {
     /// the same Sequence's interactions. Same Sequence, same objects, same ids.
     public func restoreLedger(_ restored: InteractionLedger) {
         ledger = restored
+        // The detector's span watches have just started closed. A span left
+        // open by the suspended visit is closed too (nothing is undone: the
+        // visit's scene was rebuilt), so the first real span after the resume
+        // begins normally and its end has something to undo.
+        ledger.closeAllSpansWithoutRelease()
     }
 
     /// Release everything. Idempotent, and called on every sequence
@@ -267,6 +272,16 @@ public final class InteractionController {
             self?.resolvedEntity(for: interactionId)
         }
 
+        // A SPAN TIMING on a lasting trigger watches both edges (OD-49). On a
+        // tap there is no span, and the tap route below treats it as
+        // `.everyTime`.
+        if spec.lifetime.isSpanTiming, spec.trigger.hasSpan {
+            registration.watch = startSpanWatch(for: interactionId, spec: spec,
+                                                entityId: entityId, resolver: resolver)
+            registrations[interactionId] = registration
+            return
+        }
+
         switch spec.trigger {
         case .tap:
             break
@@ -298,6 +313,96 @@ public final class InteractionController {
             )
         }
         registrations[interactionId] = registration
+    }
+
+    /// The two-edge watch behind `.whileActive`, `.onEnter` and `.onExit`.
+    private func startSpanWatch(
+        for interactionId: String, spec: InteractionSpec, entityId: String,
+        resolver: @escaping @MainActor () -> Entity?
+    ) -> SpatialTriggerDetector.Watch? {
+        let onBegin: @MainActor () -> Void = { [weak self] in self?.beginSpan(interactionId) }
+        let onEnd: @MainActor () -> Void = { [weak self] in self?.endSpan(interactionId) }
+        switch spec.trigger {
+        case .tap:
+            return nil
+        case .viewerFacing(let dwell):
+            return detector.watchViewerFacingSpan(
+                target: entityId, entityResolver: resolver, dwell: dwell,
+                progress: { [weak self] progress in
+                    guard let self, self.facingProgress[entityId] != progress else { return }
+                    self.facingProgress[entityId] = progress
+                },
+                onBegin: onBegin, onEnd: onEnd)
+        case .approach(let radius):
+            return detector.watchProximitySpan(
+                target: entityId, entityResolver: resolver, radius: radius,
+                onBegin: onBegin, onEnd: onEnd)
+        case .grab:
+            return detector.watchGrabSpan(
+                target: entityId, entityResolver: resolver,
+                onBegin: onBegin, onEnd: onEnd)
+        }
+    }
+
+    // MARK: - Spans (OD-49)
+
+    /// A lasting trigger's condition became true. The ledger decides what
+    /// runs (`InteractionLedger.beginSpan`); presence is the detector's
+    /// half, which only begins a span on a present Object.
+    @discardableResult
+    public func beginSpan(_ interactionId: String) -> Bool {
+        guard let registration = registrations[interactionId] else { return false }
+        guard isPresent(registration) else { return false }
+        let (outcome, responses) = ledger.beginSpan(interactionId)
+        guard outcome.didFire else {
+            logger.debug("Interaction '\(interactionId)' span begin refused: \(String(describing: outcome))")
+            return false
+        }
+        armedCount = ledger.armedCount
+        guard !responses.isEmpty else { return false }
+        beginningSpans.insert(interactionId)
+        dispatch(responses, interactionId: interactionId, entityId: registration.entityId)
+        beginningSpans.remove(interactionId)
+        // A RESPONSE THAT REMOVED ITS OWN PRESENCE (hid its Object, turned
+        // itself off) ended the span itself. Closed without undoing: undoing
+        // would show the Object again with the viewer still there, and the
+        // span would begin again on the next tick, for as long as they stay.
+        if ledger.isSpanOpen(interactionId),
+           !isPresent(registration) || !ledger.isEffectivelyEnabled(interactionId) {
+            logger.info("Interaction '\(interactionId)' span ended by its own response; nothing is undone")
+            ledger.closeSpanWithoutRelease(interactionId)
+        }
+        return true
+    }
+
+    /// Interactions whose span-begin responses are running right now. Read
+    /// by `setInteraction` so a response that turns its own interaction off
+    /// closes the span instead of undoing what it has just done.
+    private var beginningSpans: Set<String> = []
+
+    /// A lasting trigger's condition stopped being true, including because
+    /// the Object was hidden or left the scene. Presence is NOT required:
+    /// the Object going away is itself an end.
+    @discardableResult
+    public func endSpan(_ interactionId: String) -> Bool {
+        guard let registration = registrations[interactionId] else { return false }
+        let (outcome, responses) = ledger.endSpan(interactionId)
+        guard outcome.didFire, !responses.isEmpty else { return false }
+        dispatch(responses, interactionId: interactionId, entityId: registration.entityId)
+        return true
+    }
+
+    /// Run a response through the ONE engine path and report it.
+    private func dispatch(_ responses: [SegmentActionDTO], interactionId: String, entityId: String) {
+        let actions = responses.compactMap { dto -> SegmentAction? in
+            do { return try SegmentAction(dto: dto) } catch {
+                logger.warning("Interaction '\(interactionId)' carries an action this build cannot run: \(String(describing: error))")
+                return nil
+            }
+        }
+        logger.info("Interaction '\(interactionId)' on '\(entityId)' → \(actions.count) action(s)")
+        perform?(actions)
+        onInteractionFired?(entityId, interactionId)
     }
 
     // MARK: - Firing
@@ -369,16 +474,7 @@ public final class InteractionController {
             registrations[interactionId]?.watch = nil
         }
         armedCount = ledger.armedCount
-
-        let actions = responses.compactMap { dto -> SegmentAction? in
-            do { return try SegmentAction(dto: dto) } catch {
-                logger.warning("Interaction '\(interactionId)' carries an action this build cannot run: \(String(describing: error))")
-                return nil
-            }
-        }
-        logger.info("Interaction '\(interactionId)' on '\(registration.entityId)' → \(actions.count) action(s)")
-        perform?(actions)
-        onInteractionFired?(registration.entityId, interactionId)
+        dispatch(responses, interactionId: interactionId, entityId: registration.entityId)
         return true
     }
 
@@ -482,6 +578,16 @@ public final class InteractionController {
         } else {
             registrations[interactionId]?.watch?.cancel()
             registrations[interactionId]?.watch = nil
+            // An open span ends with its watch: a `.whileActive` response is
+            // undone rather than left on, and an `.onExit` that is now off
+            // just closes (the ledger refuses it).
+            if ledger.isSpanOpen(interactionId) {
+                if beginningSpans.contains(interactionId) {
+                    ledger.closeSpanWithoutRelease(interactionId)
+                } else {
+                    endSpan(interactionId)
+                }
+            }
         }
         armedCount = ledger.armedCount
     }
@@ -602,6 +708,15 @@ public final class InteractionController {
                     _ = offerToGate?(entityId, gateAction.trigger, false, true)
                     return
                 }
+                // AN EXPLORE AREA'S EXIT, offered from Area entry (OD-23).
+                // The same route: the gate path decides whether the act
+                // finishes the Area.
+                if let areaExit = areaExitAction, areaExit.entityName == entityId,
+                   areaExit.action.label == name {
+                    logger.info("Accessibility action ‘\(name)’ → Explore Area exit on '\(entityId)'")
+                    _ = offerToGate?(entityId, areaExit.action.trigger, false, true)
+                    return
+                }
             }
         }
 
@@ -653,6 +768,25 @@ public final class InteractionController {
         for name in affected { refreshAccessibilityActions(for: name) }
     }
 
+    /// The accessible equivalent of an Explore Area's exit, published from
+    /// Area ENTRY so an early act is open to everyone (OD-23). Kept apart
+    /// from `gateActions`, which a Cue inside the Area clears when it
+    /// resolves, while the Area's exit is still open.
+    @ObservationIgnored private var areaExitAction: (entityName: String, action: GateAction)?
+
+    public func setAreaExitAction(entityName: String, label: String, trigger: InteractionTrigger) {
+        let previous = areaExitAction?.entityName
+        areaExitAction = (entityName, GateAction(label: label, trigger: trigger))
+        if let previous, previous != entityName { refreshAccessibilityActions(for: previous) }
+        refreshAccessibilityActions(for: entityName)
+    }
+
+    public func clearAreaExitAction() {
+        guard let previous = areaExitAction?.entityName else { return }
+        areaExitAction = nil
+        refreshAccessibilityActions(for: previous)
+    }
+
     /// Rebuild one entity's custom actions from its interactions plus any
     /// active gate equivalent. Cheap, and only on a gate transition.
     private func refreshAccessibilityActions(for entityName: String) {
@@ -662,6 +796,10 @@ public final class InteractionController {
         var labels: [LocalizedStringResource] = interactions(on: entityName)
             .filter { ledger.isEffectivelyEnabled($0.id) && $0.trigger.requiresSpatialInput }
             .map { LocalizedStringResource(stringLiteral: Self.customActionName(for: $0)) }
+        if let areaExit = areaExitAction, areaExit.entityName == entityName,
+           gateActions[entityName]?.label != areaExit.action.label {
+            labels.insert(LocalizedStringResource(stringLiteral: areaExit.action.label), at: 0)
+        }
         if let gateAction = gateActions[entityName] {
             labels.insert(LocalizedStringResource(stringLiteral: gateAction.label), at: 0)
         }

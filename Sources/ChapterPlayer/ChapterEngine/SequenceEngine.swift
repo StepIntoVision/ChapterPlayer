@@ -64,7 +64,22 @@ public final class SequenceEngine {
     /// still being fired; nil the rest of the time. See `alignToSeek`.
     private var catchingUpTo: TimeInterval?
     public private(set) var isPaused: Bool = false
-    public private(set) var isPlaying: Bool = false
+    public private(set) var isPlaying: Bool = false {
+        // Anything that starts the clock again (a play, a jump, a seek)
+        // leaves the end the Sequence stopped on.
+        didSet { if isPlaying { heldEndTime = nil } }
+    }
+    /// WHERE A SEQUENCE THAT ENDED WITHOUT MOVING ON STOPPED (OD-45).
+    ///
+    /// Set only by a natural completion that is not a hold, and read by
+    /// `sequenceAnimationTime` while the engine is not playing. The owner's
+    /// rule: a Sequence that ends nowhere "ends like finishing a video". Every
+    /// authored clock (Environment cues, captions, keyed materials and parts,
+    /// audio automation, the video surface) samples this one clock, so holding
+    /// it at the end keeps them all on their END state instead of snapping
+    /// back to their t=0 state. Cleared by `stop()` and by anything that
+    /// plays again.
+    private var heldEndTime: TimeInterval?
 
     // MARK: - Gate State
 
@@ -471,7 +486,8 @@ public final class SequenceEngine {
     /// `totalElapsed` (wall time minus pauses), this clock stops at a
     /// gated segment's end and never drifts when gates stretch real time.
     public var sequenceAnimationTime: TimeInterval {
-        guard let sequence = currentSequence, isPlaying else { return 0 }
+        guard let sequence = currentSequence else { return 0 }
+        guard isPlaying else { return heldEndTime ?? 0 }
         let index = max(0, min(currentSegmentIndex, sequence.segments.count - 1))
         var start: TimeInterval = 0
         for i in 0..<index { start += sequence.segments[i].duration }
@@ -499,6 +515,7 @@ public final class SequenceEngine {
         subElementKeyDriver?.stop(tearDown: fullReset)
         isPaused = false
         isPlaying = false
+        heldEndTime = nil
         catchingUpTo = nil
         segmentPausedDuration = 0
         sequencePausedDuration = 0
@@ -1085,13 +1102,18 @@ public final class SequenceEngine {
             sendStatus(isComplete: true)
         } else {
             isPlaying = false
+            // THE CLOCK STAYS AT THE END (OD-45). Set after `isPlaying`
+            // because its didSet clears the hold only on a start. Every
+            // driver that follows the authored clock now reads the end, so
+            // the Environment, captions and materials stay on their final
+            // state, like a video that finished.
+            heldEndTime = sequence.totalDuration
             stopStatusReporting()
             sendStatus(playing: false)
-            // Deregister the sequence's animation tracks: with isPlaying
-            // false the animation clock reads 0, so a still-registered
-            // track would slam every keyed entity back to its t=0 pose on
-            // the next per-frame sample. Entities keep the final sampled
-            // transforms; a subsequent play/jump re-registers.
+            // Deregister the sequence's animation tracks: entities keep the
+            // final sampled transforms, and nothing samples a curve while
+            // the Sequence is not playing. A subsequent play/jump
+            // re-registers.
             entityExecutor?.setSequenceAnimation(tracks: [], clock: nil)
         }
 
@@ -1128,6 +1150,9 @@ public final class SequenceEngine {
         currentGate = nil
         waitStartTime = nil
         onGateEnded?()
+        // THE GATE RESOLVED, so its detection, its accessible equivalent and
+        // its drawn Prompt (OD-38) go with it, as `GateDetecting` promises.
+        gateDetector?.gateDidEnd()
         gateContinuation?.resume()
         gateContinuation = nil
         if resumingPlayback, isPaused {
@@ -1262,6 +1287,9 @@ public final class SequenceEngine {
         currentGate = nil
         waitStartTime = nil
         onGateEnded?()
+        // A stop, a jump or a seek ends the wait: the Cue's detection and its
+        // drawn Prompt go too.
+        gateDetector?.gateDidEnd()
         gateContinuation?.resume()
         gateContinuation = nil
     }
@@ -1541,8 +1569,22 @@ public final class SequenceEngine {
             // here, and the navigator decides whether it is suspended (Go To)
             // or discarded (Restart / End). Tearing down from inside a segment
             // dispatch would race the very playback issuing it.
-            logger.info("[flow] authored navigation requested: \(String(describing: intent))")
-            onNavigationRequested?(intent)
+            //
+            // A DECISION READS MEMORY WHERE IT IS AUTHORED. The host navigates
+            // on a later main-actor turn, by which time the responses after
+            // this one (a Remember, say) have already run. So a branch is
+            // resolved here, in authored order, as the Mac preview does; a
+            // branch that matches nothing and has no Otherwise does nothing.
+            var requested = intent
+            if case .branch = intent, let store = storyState {
+                guard let resolved = intent.resolving(in: store.ledger) else {
+                    logger.info("[flow] decision matched nothing and has no Otherwise; nothing happens")
+                    return
+                }
+                requested = resolved
+            }
+            logger.info("[flow] authored navigation requested: \(String(describing: requested))")
+            onNavigationRequested?(requested)
 
         case .setStoryState(let mutation):
             // THE ENGINE DOES NOT OWN THE MEMORY. It hands the change to the

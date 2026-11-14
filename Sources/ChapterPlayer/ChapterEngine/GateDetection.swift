@@ -16,6 +16,7 @@
 //  orchestrator message → `satisfyGate()`), exactly as before.
 //
 
+import ChapterScript
 import Combine
 import Foundation
 import OSLog
@@ -87,6 +88,10 @@ public final class GateDetectionController: GateDetecting {
     public private(set) var dwellProgress: Double = 0
 
     @ObservationIgnored private var watch: SpatialTriggerDetector.Watch?
+    /// The early watch on an Explore Area's exit (OD-23). Separate from
+    /// `watch` because a Cue inside the Area may wait while the Area's exit
+    /// is already being sensed, and resolving that Cue must not stop it.
+    @ObservationIgnored private var areaExitWatch: SpatialTriggerDetector.Watch?
 
     /// A gate began waiting / resolved. `ChapterPlayerCore` uses these to
     /// publish and withdraw the gate's ACCESSIBLE EQUIVALENT on its target —
@@ -152,6 +157,44 @@ public final class GateDetectionController: GateDetecting {
             }
             watch = detector.watchGrab(target: target, onTriggered: satisfy)
         }
+    }
+
+    // MARK: Explore Area exit, from Area entry (OD-23)
+
+    /// SENSE AN EXPLORE AREA'S EXIT FROM THE MOMENT THE AREA IS ENTERED, so an
+    /// early act counts. Same detector, same geometry as the waiting Cue; the
+    /// difference is only WHEN it starts. Tap, orchestrator and any arrive
+    /// through the activation path (`ChapterPlayerCore.offerActivationToGate`),
+    /// and a Memory exit has nothing to sense, so those install nothing here.
+    ///
+    /// The watch REPEATS: `satisfy` is the caller's question ("does Memory
+    /// allow it yet?"), and an act it turns down must be able to come again.
+    /// The caller ends the watch when the Area resolves.
+    public func armAreaExit(_ exit: SegmentGateDTO, satisfy: @escaping @MainActor () -> Void) {
+        disarmAreaExit()
+        switch exit.type {
+        case .tap, .orchestrator, .any, .storyCondition:
+            break
+        case .viewerFacing:
+            guard let target = exit.targetEntity else { return }
+            areaExitWatch = detector.watchViewerFacing(target: target, repeats: true,
+                                                       onTriggered: satisfy)
+        case .proximity:
+            guard let target = exit.targetEntity else { return }
+            areaExitWatch = detector.watchProximity(target: target, radius: exit.radius,
+                                                    repeats: true, arming: .immediate,
+                                                    onTriggered: satisfy)
+        case .grab:
+            guard let target = exit.targetEntity else { return }
+            areaExitWatch = detector.watchGrab(target: target, repeats: true,
+                                               onTriggered: satisfy)
+        }
+    }
+
+    /// Stop sensing the Area's exit early. Idempotent.
+    public func disarmAreaExit() {
+        areaExitWatch?.cancel()
+        areaExitWatch = nil
     }
 
     public func gateDidEnd() {

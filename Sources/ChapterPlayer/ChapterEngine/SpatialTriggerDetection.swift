@@ -342,4 +342,206 @@ public final class SpatialTriggerDetector {
         }
         watch.subscription = subscription
     }
+
+    // MARK: - Spans (OD-49)
+    //
+    // A SPAN is the time a lasting condition holds: the viewer within the
+    // radius, facing the Object, or holding it. The span timings
+    // (`InteractionLifetime.whileActive` / `.onEnter` / `.onExit`) need both
+    // edges, so these watches report BEGIN and END and keep running.
+    //
+    // A span begins when the condition becomes true for ANY reason, including
+    // the Object being revealed while the viewer already stands there (no
+    // baseline: "it became active" is the event), and ends when it stops being
+    // true for any reason, including the Object being hidden or leaving the
+    // scene. Gates never use these; their watches above are unchanged.
+
+    /// Main-actor box for one span's open flag, shared by a grab watch's two
+    /// subscriptions.
+    @MainActor
+    private final class SpanState {
+        var open = false
+    }
+
+    /// Is the Object there to act on? The same presence question
+    /// `InteractionController.isPresent` asks.
+    private static func isPresent(_ entity: Entity?) -> Bool {
+        guard let entity else { return false }
+        return entity.scene != nil && entity.isEnabledInHierarchy
+    }
+
+    /// The viewer-facing span: begins when the dwell completes, ends when the
+    /// dwell has decayed to zero (the viewer turned away) or the Object is no
+    /// longer present.
+    public func watchViewerFacingSpan(
+        target: String,
+        entityResolver: (@MainActor () -> Entity?)? = nil,
+        dwell: TimeInterval? = nil,
+        progress: (@MainActor (Double) -> Void)? = nil,
+        onBegin: @escaping @MainActor () -> Void,
+        onEnd: @escaping @MainActor () -> Void
+    ) -> Watch {
+        let needed = max(dwell ?? facingDwellDuration, 0.05)
+        let tick: TimeInterval = 0.05
+        let task = Task { @MainActor [weak self] in
+            var dwelled: TimeInterval = 0
+            var open = false
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(tick))
+                guard let self, !Task.isCancelled else { return }
+                let entity = entityResolver?() ?? self.entityProvider?(target)
+                guard SpatialTriggerDetector.isPresent(entity), let entity else {
+                    dwelled = 0
+                    if open { open = false; progress?(0); onEnd() }
+                    continue
+                }
+                guard let head = self.headTransformProvider?() else { continue }
+
+                if self.isFacing(head: head, at: entity) {
+                    dwelled = min(needed, dwelled + tick)
+                } else {
+                    dwelled = max(0, dwelled - tick * 2)
+                }
+                progress?(open ? 1 : min(1, dwelled / needed))
+
+                if !open, dwelled >= needed {
+                    open = true
+                    logger.info("Viewer-facing span began on '\(target)'")
+                    onBegin()
+                } else if open, dwelled == 0 {
+                    open = false
+                    logger.info("Viewer-facing span ended on '\(target)'")
+                    progress?(0)
+                    onEnd()
+                }
+            }
+        }
+        return Watch(task: task)
+    }
+
+    /// The proximity span: begins inside `radius` (horizontal, as
+    /// `watchProximity`), ends beyond the release margin or when the Object is
+    /// no longer present. Arms immediately: an Object revealed beside the
+    /// viewer begins its span.
+    public func watchProximitySpan(
+        target: String,
+        entityResolver: (@MainActor () -> Entity?)? = nil,
+        radius: Float? = nil,
+        onBegin: @escaping @MainActor () -> Void,
+        onEnd: @escaping @MainActor () -> Void
+    ) -> Watch {
+        let trigger = max(radius ?? defaultProximityRadius, 0.05)
+        let release = trigger * 1.25
+        let task = Task { @MainActor [weak self] in
+            var open = false
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard let self, !Task.isCancelled else { return }
+                let entity = entityResolver?() ?? self.entityProvider?(target)
+                guard SpatialTriggerDetector.isPresent(entity), let entity else {
+                    if open { open = false; onEnd() }
+                    continue
+                }
+                guard let head = self.headTransformProvider?() else { continue }
+
+                let delta = entity.visualBounds(relativeTo: nil).center - head.translation
+                let distance = simd_length(SIMD3<Float>(delta.x, 0, delta.z))
+                if !open, distance <= trigger {
+                    open = true
+                    logger.info("Proximity span began on '\(target)'")
+                    onBegin()
+                } else if open, distance > release {
+                    open = false
+                    logger.info("Proximity span ended on '\(target)'")
+                    onEnd()
+                }
+            }
+        }
+        return Watch(task: task)
+    }
+
+    /// The grab span: begins when a manipulation of the Object begins, ends
+    /// when it ends.
+    public func watchGrabSpan(
+        target: String,
+        entityResolver: (@MainActor () -> Entity?)? = nil,
+        onBegin: @escaping @MainActor () -> Void,
+        onEnd: @escaping @MainActor () -> Void
+    ) -> Watch {
+        let watch = Watch()
+        let task = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let entity = entityResolver?() ?? self.entityProvider?(target),
+                   let scene = entity.scene {
+                    self.subscribeGrabSpan(target: entity, scene: scene, watch: watch,
+                                           onBegin: onBegin, onEnd: onEnd)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        watch.task = task
+        return watch
+    }
+
+    private func subscribeGrabSpan(
+        target: Entity,
+        scene: RealityKit.Scene,
+        watch: Watch,
+        onBegin: @escaping @MainActor () -> Void,
+        onEnd: @escaping @MainActor () -> Void
+    ) {
+        if target.components[ManipulationComponent.self] == nil {
+            ManipulationComponent.configureEntity(target)
+            logger.info("Grab span watch installed the manipulation stack on '\(target.name)'")
+        }
+        let state = SpanState()
+        let began = scene.subscribe(to: ManipulationEvents.WillBegin.self) { event in
+            var node: Entity? = event.entity
+            while let current = node {
+                if current === target {
+                    Task { @MainActor in
+                        guard !state.open else { return }
+                        state.open = true
+                        onBegin()
+                    }
+                    return
+                }
+                node = current.parent
+            }
+        }
+        let ended = scene.subscribe(to: ManipulationEvents.WillEnd.self) { event in
+            var node: Entity? = event.entity
+            while let current = node {
+                if current === target {
+                    Task { @MainActor in
+                        guard state.open else { return }
+                        state.open = false
+                        onEnd()
+                    }
+                    return
+                }
+                node = current.parent
+            }
+        }
+        watch.subscription = AnyCancellable {
+            began.cancel()
+            ended.cancel()
+        }
+        // A HELD OBJECT THAT IS HIDDEN OR REMOVED ENDS THE SPAN, as for every
+        // other lasting trigger. RealityKit need not send WillEnd for an
+        // Object that left the scene, so presence is polled while the span
+        // is open; the end runs once, whichever comes first.
+        watch.task = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                if state.open, !Self.isPresent(target) {
+                    state.open = false
+                    onEnd()
+                }
+            }
+        }
+    }
 }
