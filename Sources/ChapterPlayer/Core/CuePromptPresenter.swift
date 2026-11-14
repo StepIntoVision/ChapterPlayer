@@ -10,8 +10,16 @@
 //  no Object. Both go away the moment the Cue is satisfied.
 //
 //  Event-driven, never polled: `GateDetectionController.onGateActivated`
-//  shows it and `onGateResolved` hides it, so nothing here runs per frame.
-//  The waiting sign's breathing is one RealityKit animation, not a timer.
+//  shows it and `onGateResolved` hides it. The waiting sign's breathing is
+//  one RealityKit animation, not a timer. Two things wait or watch, and only
+//  while a Prompt is up:
+//  · OD-122: a Memory or Orchestrator Cue with no Prompt shows its waiting
+//    sign only after `unpromptedWaitSignDelay` (3 s); a shorter wait shows
+//    nothing. One scheduled task, cancelled by `hide()`.
+//  · TODO-99: a Prompt near an Object follows it while the Cue waits (one
+//    scene-update subscription, cancelled by `hide()`), and a very large
+//    Object gets its Prompt at its near side, near the eye line, rather than
+//    over its far-off top.
 //
 //  COMFORT AND ACCESS:
 //  · Billboarded, so it always faces the viewer.
@@ -40,31 +48,44 @@ public struct CuePromptPlan: Sendable, Equatable {
     /// sign is then drawn on its own.
     public let prompt: String?
     public let placement: Placement
+    /// Seconds the Cue waits before anything is drawn. Zero for every Cue
+    /// but a Prompt-less Memory or Orchestrator Cue (OD-122).
+    public let delay: TimeInterval
 
     /// What assistive technology reads for it.
     public var accessibilityLabel: String { prompt ?? "Waiting" }
 
-    public init(prompt: String?, placement: Placement) {
+    public init(prompt: String?, placement: Placement, delay: TimeInterval = 0) {
         self.prompt = prompt
         self.placement = placement
+        self.delay = max(0, delay)
     }
+
+    /// OD-122: how long a Memory or Orchestrator Cue with NO Prompt waits
+    /// before its waiting sign shows. MIRRORS MaestroKit's
+    /// `GateEditor.unpromptedWaitSignDelay`, which the Mac preview's banner
+    /// reads (ChapterPlayer cannot import MaestroKit); a MaestroKit test reads
+    /// this line to keep the two values equal.
+    public static let unpromptedWaitSignDelay: TimeInterval = 3
 
     /// The plan for a Cue that has begun waiting, or nil when nothing is
     /// drawn.
     ///
     /// A Memory Cue (`.storyCondition`) waits for a fact, and an
     /// orchestrator Cue for a message from outside, not for the viewer. So
-    /// without a Prompt they draw nothing: a waiting sign would ask for an
-    /// act the viewer cannot perform. With a Prompt the author meant it to
-    /// be read, and it is.
+    /// without a Prompt a short wait draws nothing, and the waiting sign
+    /// appears only once the wait runs long (OD-122): it says the story is
+    /// waiting, never that the viewer should act. With a Prompt the author
+    /// meant it to be read, and it is, at once.
     public static func plan(for gate: SegmentGate) -> CuePromptPlan? {
         let trimmed = gate.prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = (trimmed?.isEmpty ?? true) ? nil : trimmed
-        if prompt == nil, !viewerActs(gate.type) { return nil }
+        let delay: TimeInterval = (prompt == nil && !viewerActs(gate.type))
+            ? unpromptedWaitSignDelay : 0
         if let target = gate.targetEntity, !target.isEmpty {
-            return CuePromptPlan(prompt: prompt, placement: .nearObject(target))
+            return CuePromptPlan(prompt: prompt, placement: .nearObject(target), delay: delay)
         }
-        return CuePromptPlan(prompt: prompt, placement: .inFrontOfViewer)
+        return CuePromptPlan(prompt: prompt, placement: .inFrontOfViewer, delay: delay)
     }
 
     /// Does this kind of Cue wait for the viewer to do something?
@@ -96,9 +117,51 @@ public struct CuePromptPlan: Sendable, Equatable {
     public static let viewerDistance: Float = 1.4
     /// Clearance above an Object's top.
     public static let objectClearance: Float = 0.08
+
+    // MARK: Placement near an Object (TODO-99)
+
+    /// An Object wider, deeper or taller than this, in meters, is LARGE: a
+    /// Prompt over its center top could sit far overhead, or inside it.
+    public static let largeObjectSpan: Float = 1.5
+    /// The highest a large Object's Prompt sits, in meters above the eye
+    /// line (the scene root is rebased to the head, so the eye line is
+    /// y = 0): a little above it, where it is read without craning.
+    public static let largeObjectMaxRise: Float = 0.35
+
+    /// Where the Prompt sits for an Object whose visual bounds, in the
+    /// scene root's axes (the viewer at the origin, looking down -z), run
+    /// from `boundsMin` to `boundsMax`. Pure, so the rule is testable
+    /// without a scene.
+    ///
+    /// * An ordinary Object: centered, `objectClearance` above its top.
+    /// * A large Object (`largeObjectSpan`): at the point of its footprint
+    ///   nearest the viewer, pulled `objectClearance` toward them, and no
+    ///   higher than `largeObjectMaxRise` above the eye line (lower when the
+    ///   Object's top is lower). A viewer standing inside its footprint gets
+    ///   the Prompt ahead of them at that height.
+    public static func anchor(boundsMin: SIMD3<Float>, boundsMax: SIMD3<Float>) -> SIMD3<Float> {
+        let size = boundsMax - boundsMin
+        let center = (boundsMin + boundsMax) * 0.5
+        let top = boundsMax.y + objectClearance
+        let isLarge = max(size.x, max(size.y, size.z)) > largeObjectSpan
+        guard isLarge else { return SIMD3<Float>(center.x, top, center.z) }
+
+        let y = min(top, largeObjectMaxRise)
+        // The footprint's point nearest the viewer (the origin).
+        let nearX = min(max(Float(0), boundsMin.x), boundsMax.x)
+        let nearZ = min(max(Float(0), boundsMin.z), boundsMax.z)
+        let distance = (nearX * nearX + nearZ * nearZ).squareRoot()
+        guard distance > 0.0001 else {
+            // Inside the footprint: ahead of the viewer.
+            return SIMD3<Float>(0, y, -viewerDistance)
+        }
+        let pulled = max(0, distance - objectClearance) / distance
+        return SIMD3<Float>(nearX * pulled, y, nearZ * pulled)
+    }
 }
 
 #if canImport(RealityKit)
+import Combine
 import RealityKit
 import simd
 import UIKit
@@ -116,56 +179,127 @@ public final class CuePromptPresenter {
 
     /// The plan on show, if any. For hosts and tests.
     public private(set) var shown: CuePromptPlan?
+    /// A plan waiting out its `delay` (OD-122), not yet on show.
+    public private(set) var pending: CuePromptPlan?
     /// The mounted Prompt, if any.
     public private(set) var promptEntity: Entity?
 
+    /// The delayed show, cancelled by `hide()`.
+    private var pendingTask: Task<Void, Never>?
+    /// TODO-99: the Object the Prompt follows, and where the Prompt sits
+    /// relative to it. Watched only while a Prompt is up.
+    private var followedObject: Entity?
+    private var followOffset = SIMD3<Float>(repeating: 0)
+    private var followSubscription: (any Cancellable)?
+
     public init() {}
 
-    /// Show `plan`, replacing whatever was shown. Nil hides.
+    /// Show `plan`, replacing whatever was shown. Nil hides. A plan with a
+    /// `delay` waits that long first; a `hide()` (the Cue answered) or a new
+    /// `show` in the meantime means it never appears.
     public func show(_ plan: CuePromptPlan?) {
         hide()
         guard let plan else { return }
+        guard plan.delay > 0 else {
+            mount(plan)
+            return
+        }
+        pending = plan
+        let nanoseconds = UInt64(plan.delay * 1_000_000_000)
+        pendingTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled, let self, self.pending == plan else { return }
+            self.pending = nil
+            self.pendingTask = nil
+            self.mount(plan)
+        }
+    }
+
+    /// Take the Prompt away, and any Prompt still waiting out its delay.
+    /// Idempotent.
+    public func hide() {
+        pendingTask?.cancel()
+        pendingTask = nil
+        pending = nil
+        followSubscription?.cancel()
+        followSubscription = nil
+        followedObject = nil
+        promptEntity?.removeFromParent()
+        promptEntity = nil
+        shown = nil
+    }
+
+    /// Draw `plan` now.
+    private func mount(_ plan: CuePromptPlan) {
         // Recorded even with no scene to draw in (a windowed host, a test),
         // so a host can still say what the story is waiting for.
         shown = plan
         guard let root = sceneRootProvider?() else { return }
 
-        let position = Self.position(for: plan.placement, in: root,
-                                     resolving: entityProvider)
+        let object = Self.object(for: plan.placement, resolving: entityProvider)
+        let position = Self.position(for: plan.placement, in: root, object: object)
         let capHeight = CuePromptPlan.capHeight(atDistance: simd_length(position))
         let entity = Self.makePrompt(plan, capHeight: capHeight)
         entity.position = position
         root.addChild(entity)
         promptEntity = entity
+        follow(object, from: position, in: root)
 
         if UIAccessibility.isVoiceOverRunning {
             UIAccessibility.post(notification: .announcement, argument: plan.accessibilityLabel)
         }
     }
 
-    /// Take the Prompt away. Idempotent.
-    public func hide() {
-        promptEntity?.removeFromParent()
-        promptEntity = nil
-        shown = nil
+    // MARK: - Following a moving Object (TODO-99)
+
+    /// Keep the Prompt where it was put relative to `object` while the Cue
+    /// waits: an Object that moves (an animation, a grab) takes its Prompt
+    /// with it. One scene-update subscription, only while a Prompt is up.
+    private func follow(_ object: Entity?, from position: SIMD3<Float>, in root: Entity) {
+        guard let object, let scene = root.scene else { return }
+        followedObject = object
+        followOffset = position - object.position(relativeTo: root)
+        followSubscription = scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
+            MainActor.assumeIsolated { self?.followTick() }
+        }
+    }
+
+    private func followTick() {
+        guard let object = followedObject, let prompt = promptEntity,
+              let root = prompt.parent, object.scene != nil else { return }
+        let target = object.position(relativeTo: root) + followOffset
+        // Moved by less than half a centimeter: leave it, so a still Object
+        // costs one read per frame and no write.
+        if simd_length(target - prompt.position) > 0.005 {
+            prompt.position = target
+        }
     }
 
     // MARK: - Placement
 
+    static func object(for placement: CuePromptPlan.Placement,
+                       resolving entityProvider: ((String) -> Entity?)?) -> Entity? {
+        guard case .nearObject(let name) = placement else { return nil }
+        return entityProvider?(name)
+    }
+
     static func position(for placement: CuePromptPlan.Placement, in root: Entity,
                          resolving entityProvider: ((String) -> Entity?)?) -> SIMD3<Float> {
+        position(for: placement, in: root, object: object(for: placement, resolving: entityProvider))
+    }
+
+    static func position(for placement: CuePromptPlan.Placement, in root: Entity,
+                         object: Entity?) -> SIMD3<Float> {
         let ahead = SIMD3<Float>(0, -0.18 * CuePromptPlan.viewerDistance,
                                  -CuePromptPlan.viewerDistance)
-        guard case .nearObject(let name) = placement,
-              let object = entityProvider?(name) else { return ahead }
+        guard let object else { return ahead }
         let bounds = object.visualBounds(relativeTo: root)
         if bounds.isEmpty {
             return object.position(relativeTo: root)
                 + SIMD3<Float>(0, CuePromptPlan.objectClearance * 3, 0)
         }
-        return SIMD3<Float>(bounds.center.x,
-                            bounds.max.y + CuePromptPlan.objectClearance,
-                            bounds.center.z)
+        // TODO-99: a very large Object is not crowned from its far-off top.
+        return CuePromptPlan.anchor(boundsMin: bounds.min, boundsMax: bounds.max)
     }
 
     // MARK: - The look

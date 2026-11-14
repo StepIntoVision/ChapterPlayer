@@ -77,6 +77,30 @@ public final class StoryStateStore {
         onChange?()
     }
 
+    // MARK: - Resume (OD-98)
+
+    /// What the story remembers right now, for saving with a visit that is
+    /// being left (`SuspendedVisit.memorySnapshot`).
+    public var memorySnapshot: StoryStateSnapshot { ledger.memorySnapshot }
+
+    /// PUT BACK THE MEMORY A RESUMED VISIT WAS LEFT WITH (OD-98). The owner's
+    /// rule: Resume restores the Memory snapshot saved when the visit was
+    /// left. Only states this session defines are written, with values of
+    /// their own kind (`StoryStateLedger.restore`); `keeping` names states
+    /// that are not rolled back. Tells anyone waiting, exactly as a mutation
+    /// does, so a Cue waiting on a fact sees the restored one.
+    ///
+    /// Not an authoring path, and not a session boundary: it neither begins
+    /// nor ends a session, and does nothing outside one.
+    public func restore(_ snapshot: StoryStateSnapshot, keeping: Set<String> = []) {
+        guard isSessionActive else { return }
+        let before = ledger.memorySnapshot
+        ledger.restore(snapshot, keeping: keeping)
+        guard ledger.memorySnapshot != before else { return }
+        logger.info("[story] Resume restored the Memory saved when the visit was left")
+        onChange?()
+    }
+
     // MARK: - Mutation
 
     /// Apply one authored change and tell anyone waiting.

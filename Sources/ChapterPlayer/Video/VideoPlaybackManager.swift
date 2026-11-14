@@ -103,6 +103,25 @@ public class VideoPlaybackManager {
     public var sequenceClock: (() -> TimeInterval)?
     /// The Sequence's Effect Key curves, by Effect instance id.
     public var effectKeyTracksProvider: (() -> [EffectKeyTrack])?
+    /// OD-24: the authored Sequence now playing, with the document's video
+    /// decisions, so a play can find its occurrence's Convergence and Flat
+    /// View by `VideoAction.occurrenceId`. Wired by the host that holds the
+    /// document; nil ⇒ every panel plays as an ordinary plane, which is
+    /// exactly what it did before.
+    public var authoredStereoProvider: (() -> HeadsetStereoPresentation.Authored?)?
+    /// One playing occurrence's stereo decisions, by channel.
+    private struct StereoChannelState {
+        var occurrence: HeadsetStereoPresentation.Occurrence
+        var firedAt: TimeInterval?
+        var span: TimeInterval?
+        /// The master's projection: the container's own tag once it has been
+        /// read, the author's decision until then.
+        var projection: SourceProjection
+    }
+    @ObservationIgnored private var stereoStates: [String: StereoChannelState] = [:]
+    /// The aim each Flat View panel was last built for, by entity name.
+    /// Absent means the panel carries its ordinary plane.
+    @ObservationIgnored private var flatViewAims: [String: VirtualCameraSpec] = [:]
     let effectSurface = EffectPanelSurface()
     private var surfaceTicker: Task<Void, Never>?
     /// The authored clock as the previous surface tick read it; nil before
@@ -243,6 +262,9 @@ public class VideoPlaybackManager {
     // MARK: - Play
 
     public func play(action: VideoAction) {
+        // OD-24: before the attach, so the panel it builds is already the
+        // occurrence's Flat View.
+        adoptStereoPresentation(for: action)
         playCore(action: action)
         // THE OCCURRENCE STAMP rides the channel, and the per-frame surface
         // begins when the occurrence needs it: an enabled stack, a
@@ -259,6 +281,12 @@ public class VideoPlaybackManager {
         ch.fadeIn = action.fadeIn
         ch.fadeOut = action.fadeOut
         channels[action.channel] = ch
+        // OD-24: a panel bound now (a warmed or cold play) takes its Flat View
+        // here. A cut still holding the outgoing picture builds it at the
+        // reveal instead, with the incoming Clip's own material.
+        if cutHolds[action.channel] == nil, pendingDissolves[action.channel] == nil {
+            refreshFlatViewPanel(channelKey: action.channel, at: sequenceClock?())
+        }
         if let pitch = action.pitch, let item = ch.player.currentItem {
             // FL-13: pitch is AUDIBLE LIVE — the algorithm rides the item,
             // chosen by the occurrence's pitch handling (the Mac's rule).
@@ -598,6 +626,14 @@ public class VideoPlaybackManager {
             entity.components.set(OpacityComponent(opacity: 0))
         }
         let askedAt = Date.now
+        // OD-63: play to on screen, measured in Release. Only a Screen is
+        // revealed by this gate, so only a Screen opens the interval.
+        let onScreenInterval: OSSignpostIntervalState? = {
+            guard case .entity = action.presentation else { return nil }
+            return PlaybackDiagnostics.signposter.beginInterval(
+                "Play to On Screen", id: PlaybackDiagnostics.signposter.makeSignpostID(),
+                "'\(action.file, privacy: .private(mask: .hash))' on '\(action.channel, privacy: .public)'")
+        }()
         Task { @MainActor [weak self, weak player] in
             guard let self, let player else { return }
             let isReady = await self.awaitCurrentItemReadyToPlay(player: player, timeout: 8.0)
@@ -659,13 +695,14 @@ public class VideoPlaybackManager {
                     if onTheScreensPlayer, let entity = live.entity,
                        var model = entity.components[ModelComponent.self],
                        model.materials.contains(where: { ($0 as? VideoMaterial)?.avPlayer === player }),
-                       case .entity(_, let width, let height) = action.presentation {
+                       case .entity(let panelName, let width, let height) = action.presentation {
                         // THE MATERIAL STAYS. Only the plane can differ between
                         // two Clips (a crop), and a mesh is inert data: writing
                         // the model back with its LIVE material re-registers
                         // nothing.
                         let radius = entity.components[VideoPanelStyleComponent.self]?.cornerRadius ?? 0
-                        model.mesh = VideoPanelCropMesh.make(
+                        model.mesh = self.panelMesh(
+                            channelKey: action.channel, file: action.file, entityName: panelName,
                             width: width, height: height,
                             cornerRadius: min(radius, min(width, height) / 2), crop: action.crop)
                         entity.components.set(model)
@@ -689,7 +726,16 @@ public class VideoPlaybackManager {
                     entity.components.set(OpacityComponent(opacity: 1))
                 }
                 let ms = Date.now.timeIntervalSince(askedAt) * 1000
-                logger.notice("[cut] '\(action.file, privacy: .public)' on screen \(String(format: "%.0f", ms)) ms after play (\(onTheScreensPlayer ? "same player and material" : bindingAtReveal ? "outgoing picture held, new material" : "Screen hidden meanwhile", privacy: .public))")
+                let landing = onTheScreensPlayer ? "same player and material"
+                    : bindingAtReveal ? "outgoing picture held, new material" : "Screen hidden meanwhile"
+                // OD-63: routine, so `.info` (not kept); the file name is
+                // hashed, so two lines about one file still match up.
+                logger.info("[cut] '\(action.file, privacy: .private(mask: .hash))' on screen \(ms, format: .fixed(precision: 0)) ms after play (\(landing, privacy: .public))")
+                if let onScreenInterval {
+                    PlaybackDiagnostics.signposter.endInterval(
+                        "Play to On Screen", onScreenInterval,
+                        "\(ms, format: .fixed(precision: 0)) ms, \(landing, privacy: .public)")
+                }
             }
         }
     }
@@ -1018,6 +1064,7 @@ public class VideoPlaybackManager {
         }
         stopEpoch += 1
         explorePausedChannels.remove(channel)
+        cueWaitHeldChannels.remove(channel)
         channels.removeValue(forKey: channel)
         ch.player.pause()
         let outgoingItem = ch.player.currentItem
@@ -1044,6 +1091,7 @@ public class VideoPlaybackManager {
         // re-store it after this stop.
         stopEpoch += 1
         explorePausedChannels.remove(channel)
+        cueWaitHeldChannels.remove(channel)
         // A stop that lands while a cut is still in hand ends both Clips: the
         // outgoing one owes the Screen its full stop after all.
         releaseCutHold(channel: channel, releasesDestination: channels[channel] == nil)
@@ -1184,7 +1232,8 @@ public class VideoPlaybackManager {
     /// What "everything playing right now" means to a Story Region.
     public var playRequestedChannelNames: [String] {
         channels.compactMap { key, channel in
-            channel.isPlayRequested && !explorePausedChannels.contains(key) ? key : nil
+            channel.isPlayRequested && !explorePausedChannels.contains(key)
+                && !cueWaitHeldChannels.contains(key) ? key : nil
         }
     }
 
@@ -1209,6 +1258,41 @@ public class VideoPlaybackManager {
         logger.info("[explore] video channel '\(channel)' resumes")
     }
 
+    // MARK: - Cue-wait hold (OD-87)
+
+    /// Channels an ordinary Cue wait has frozen on their current frame,
+    /// because the clip's "while waiting at a Cue" setting says Freeze.
+    ///
+    /// Its own set, apart from the Explore hold's: the two have different
+    /// owners (the engine's Cue wait, a Story Region) and neither may release
+    /// the other's. Consulted by `resumeAll()` and the retime tick for the
+    /// same reasons, and pruned by `stop(channel:)`.
+    public private(set) var cueWaitHeldChannels: Set<String> = []
+
+    /// FREEZE ONE CHANNEL FOR A CUE WAIT. Returns false when there is no such
+    /// channel, so the engine records no hold that nothing would release.
+    /// A retimed clip is parked where its curve put it; the retime tick
+    /// leaves a held player alone, as it does for an Explore hold.
+    @discardableResult
+    public func holdForCueWait(channel: String) -> Bool {
+        guard let ch = channels[channel] else { return false }
+        cueWaitHeldChannels.insert(channel)
+        ch.player.pause()
+        logger.info("[cue] video channel '\(channel)' holds its frame while the story waits")
+        return true
+    }
+
+    /// Let a Cue-wait freeze go. `resume` is false while the transport is
+    /// paused (its `resumeAll()` owns the restart) and on a teardown. A
+    /// retimed clip gets its curve's rate back on the next surface tick.
+    public func releaseCueWaitHold(channel: String, resume: Bool) {
+        guard cueWaitHeldChannels.remove(channel) != nil else { return }
+        guard resume, !transportPaused, !explorePausedChannels.contains(channel),
+              let ch = channels[channel], ch.isPlayRequested else { return }
+        ch.player.play()
+        logger.info("[cue] video channel '\(channel)' plays on from its frame")
+    }
+
     public func pauseAll() {
         transportPaused = true
         for (_, channel) in channels {
@@ -1226,8 +1310,10 @@ public class VideoPlaybackManager {
         // the eventual real play() started mid-file or on a dead frame.
         //
         // …and never one an Explore hold froze: the region releases it.
+        // …nor one a Cue wait froze: the engine releases it (OD-87).
         for (key, channel) in channels
-        where channel.isPlayRequested && !explorePausedChannels.contains(key) {
+        where channel.isPlayRequested && !explorePausedChannels.contains(key)
+            && !cueWaitHeldChannels.contains(key) {
             channel.player.play()
         }
         logger.info("Resumed all requested video channels")
@@ -1340,7 +1426,9 @@ public class VideoPlaybackManager {
                 // sample the crop's sub-rect — the same rule Maestro Studio's
                 // Viewer and export apply, duplicated here because the player
                 // deliberately depends on ChapterScript alone.
-                let mesh = VideoPanelCropMesh.make(
+                // OD-24: or the occurrence's Flat View, when it has one.
+                let mesh = panelMesh(
+                    channelKey: channelKey, file: channel.file, entityName: name,
                     width: width, height: height,
                     cornerRadius: min(radius, min(width, height) / 2),
                     crop: crop)
@@ -1955,6 +2043,131 @@ public class VideoPlaybackManager {
         }
     }
 
+    // MARK: - Convergence and Flat View (OD-24)
+
+    /// Find the playing occurrence's stereo decisions and keep them on the
+    /// channel. Read once per play, never per frame.
+    private func adoptStereoPresentation(for action: VideoAction) {
+        guard let id = action.occurrenceId,
+              let authored = authoredStereoProvider?(),
+              let occurrence = HeadsetStereoPresentation.occurrence(id: id, in: authored),
+              occurrence.hasStereoDecision else {
+            stereoStates[action.channel] = nil
+            return
+        }
+        stereoStates[action.channel] = StereoChannelState(
+            occurrence: occurrence, firedAt: action.firedAt, span: action.timelineSpan,
+            projection: HeadsetStereoPresentation.resolvedProjection(
+                declaredKind: nil, decided: occurrence.decidedProjection))
+        if occurrence.virtualCamera != nil {
+            loadDeclaredProjection(channelKey: action.channel, occurrenceId: id, file: action.file)
+        }
+        // CONVERGENCE IS RESOLVED, NOT DRAWN: a panel shows one texture to
+        // both eyes, so there is no per-eye picture to move. Said once per
+        // play, rather than leaving an author to wonder.
+        if occurrence.baseConvergence != 0 || occurrence.stereoTracks.contains(where: \.hasAnyKeys) {
+            let value = HeadsetStereoPresentation.effectiveConvergence(
+                of: occurrence, at: sequenceClock?() ?? action.firedAt ?? 0)
+            logger.info("[stereo] channel '\(action.channel, privacy: .public)': Convergence \(value, format: .fixed(precision: 3)) is authored; the headset has no per-eye panel surface yet, so it is not rendered")
+        }
+    }
+
+    /// OD-24: the effective Convergence of what plays on `channel` now, by
+    /// the Mac's rule. Nil when the occurrence authored none.
+    public func effectiveConvergence(channel: String) -> Float? {
+        guard let state = stereoStates[channel],
+              channels[channel]?.file == state.occurrence.file else { return nil }
+        return HeadsetStereoPresentation.effectiveConvergence(
+            of: state.occurrence, at: sequenceClock?() ?? state.firedAt ?? 0)
+    }
+
+    /// The Flat View aim for `key` at `now`, resolved the Mac's way.
+    private func flatViewAim(for key: String, at now: TimeInterval?) -> VirtualCameraSpec? {
+        guard let state = stereoStates[key], let spec = state.occurrence.virtualCamera else { return nil }
+        return HeadsetStereoPresentation.resolvedAim(
+            spec, atFraction: HeadsetStereoPresentation.fraction(
+                at: now, firedAt: state.firedAt, span: state.span))
+    }
+
+    /// THE ONE PANEL-MESH WRITER for a Screen: the occurrence's Flat View
+    /// grid when it has one, else the ordinary (possibly cropped) plane.
+    /// Records which it built, so a later refresh knows what is there.
+    private func panelMesh(channelKey: String, file: String, entityName: String,
+                           width: Float, height: Float, cornerRadius: Float,
+                           crop: VideoCropRect?) -> MeshResource {
+        if let state = stereoStates[channelKey], state.occurrence.file == file,
+           let aim = flatViewAim(for: channelKey, at: sequenceClock?()) {
+            let region = HeadsetStereoPresentation.leftEyeRegion(
+                clipLayout: state.occurrence.clipLayout,
+                decidedLayout: state.occurrence.decidedLayout,
+                eyeOrder: state.occurrence.eyeOrder)
+            let grid = HeadsetStereoPresentation.flatViewGrid(
+                aim: aim, coverage: .forProjection(state.projection), region: region,
+                width: width, height: height)
+            if let mesh = FlatViewPanelMesh.make(grid) {
+                flatViewAims[entityName] = aim
+                return mesh
+            }
+        }
+        flatViewAims[entityName] = nil
+        return VideoPanelCropMesh.make(width: width, height: height,
+                                       cornerRadius: cornerRadius, crop: crop)
+    }
+
+    /// Rebuild a Screen's panel when its Flat View aim changed: on play, on a
+    /// keyed aim's tick, and when the master's own projection tag arrives.
+    /// Writes nothing when the aim is unchanged, so an ordinary clip costs
+    /// one dictionary read.
+    private func refreshFlatViewPanel(channelKey: String, at now: TimeInterval?,
+                                      force: Bool = false) {
+        guard let ch = channels[channelKey],
+              case .entity(let name, let width, let height) = ch.presentation,
+              let entity = videoEntityRegistry[name],
+              var model = entity.components[ModelComponent.self] else { return }
+        let aim = stereoStates[channelKey]?.occurrence.file == ch.file
+            ? flatViewAim(for: channelKey, at: now) : nil
+        if !force, HeadsetStereoPresentation.sameAim(aim, flatViewAims[name]) { return }
+        let radius = entity.components[VideoPanelStyleComponent.self]?.cornerRadius ?? 0
+        model.mesh = panelMesh(channelKey: channelKey, file: ch.file, entityName: name,
+                               width: width, height: height,
+                               cornerRadius: min(radius, min(width, height) / 2), crop: ch.crop)
+        entity.components.set(model)
+    }
+
+    /// The container's own projection outranks the author's decision (the
+    /// Mac's precedence), and reading it is asynchronous, so a Flat View may
+    /// be rebuilt once when it lands.
+    private func loadDeclaredProjection(channelKey: String, occurrenceId: String, file: String) {
+        guard let url = findVideoURL(file: file) else { return }
+        Task { @MainActor [weak self] in
+            let kind = await Self.declaredProjectionKind(url: url)
+            guard let self, var state = self.stereoStates[channelKey],
+                  state.occurrence.id == occurrenceId else { return }
+            let projection = HeadsetStereoPresentation.resolvedProjection(
+                declaredKind: kind, decided: state.occurrence.decidedProjection)
+            guard projection != state.projection else { return }
+            state.projection = projection
+            self.stereoStates[channelKey] = state
+            if self.cutHolds[channelKey] == nil, self.pendingDissolves[channelKey] == nil {
+                self.refreshFlatViewPanel(channelKey: channelKey, at: self.sequenceClock?(), force: true)
+            }
+        }
+    }
+
+    /// The raw `ProjectionKind` string a file's video track declares, if any.
+    static func declaredProjectionKind(url: URL) async -> String? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let descriptions = try? await track.load(.formatDescriptions) else { return nil }
+        for description in descriptions {
+            if let extensions = CMFormatDescriptionGetExtensions(description) as? [String: Any],
+               let kind = extensions["ProjectionKind"] as? String {
+                return kind
+            }
+        }
+        return nil
+    }
+
     // MARK: - The surface ticker (FL-09 … FL-13)
 
     /// A channel needs the per-frame path while it carries an enabled
@@ -1979,6 +2192,12 @@ public class VideoPlaybackManager {
         // only updated when an Effect happened to be on would be a fade
         // that worked by accident.
         if (ch.fadeIn ?? 0) > 0 || (ch.fadeOut ?? 0) > 0,
+           ch.firedAt != nil, ch.span != nil { return true }
+        // OD-24: a KEYED Flat View moves its aim over the occurrence, and
+        // the panel's grid follows it on the same tick.
+        if case .entity = ch.presentation,
+           let state = stereoStates[key], state.occurrence.file == ch.file,
+           HeadsetStereoPresentation.isKeyed(state.occurrence.virtualCamera),
            ch.firedAt != nil, ch.span != nil { return true }
         return false
     }
@@ -2043,6 +2262,9 @@ public class VideoPlaybackManager {
             let sourceTime = applyRetime(key: key, ch, at: now,
                                          authoredClockMoving: authoredClockMoving)
             applyClipFade(key: key, ch, entity: entity, at: now)
+            if HeadsetStereoPresentation.isKeyed(stereoStates[key]?.occurrence.virtualCamera) {
+                refreshFlatViewPanel(channelKey: key, at: now)
+            }
             let stack = ch.effects ?? []
             var job = EffectPanelSurface.Job(
                 channel: key, entity: entity, player: ch.player,
@@ -2138,7 +2360,8 @@ public class VideoPlaybackManager {
         // mapped frame every tick: once parked that does nothing, and it is
         // the one thing that re-parks a frozen clip after a resume's
         // `play()` started it.
-        if transportPaused || explorePausedChannels.contains(key) {
+        if transportPaused || explorePausedChannels.contains(key)
+            || cueWaitHeldChannels.contains(key) {
             return mapped
         }
         if rate > 0.001 {
@@ -2222,6 +2445,22 @@ public class VideoPlaybackManager {
 
 
 // MARK: - FL-04 crop mesh
+
+/// A Flat View panel (OD-24): the grid `HeadsetStereoPresentation` computes,
+/// as a RealityKit mesh the panel's `VideoMaterial` samples through.
+@MainActor
+enum FlatViewPanelMesh {
+    static func make(_ grid: HeadsetStereoPresentation.FlatViewGrid) -> MeshResource? {
+        guard !grid.indices.isEmpty else { return nil }
+        var descriptor = MeshDescriptor(name: "flatViewPanel")
+        descriptor.positions = MeshBuffer(grid.positions)
+        descriptor.normals = MeshBuffer(
+            [SIMD3<Float>](repeating: SIMD3(0, 0, 1), count: grid.positions.count))
+        descriptor.textureCoordinates = MeshBuffer(grid.uvs)
+        descriptor.primitives = .triangles(grid.indices)
+        return try? MeshResource.generate(from: [descriptor])
+    }
+}
 
 /// The cropped-panel mesh rule (FL-04). Mirrors Maestro Studio's
 /// `CroppedPanelMesh` — one behavior, stated twice because this package

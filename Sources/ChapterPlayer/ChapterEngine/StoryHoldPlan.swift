@@ -39,6 +39,10 @@ public enum StoryHoldPlan {
         /// The runtime cannot perform this. It is left running, and the
         /// reason is logged — never silently dropped.
         case refuse(reason: String)
+        /// It repeats with a LOOPING Area's range (OD-25): the host restarts
+        /// it at its place in each loop (`StoryRegionLoopMedia`). Only
+        /// `areaLoopCommand` answers this.
+        case loopWithArea
     }
 
     /// The command for one authored behavior on entering the hold.
@@ -58,12 +62,44 @@ public enum StoryHoldPlan {
         }
     }
 
-    /// What content does when the author said NOTHING about it.
+    /// WHAT ONE OCCURRENCE DOES WHILE A LOOPING AREA WAITS (OD-25, OD-99).
     ///
-    /// Video holds its frame — "everything holds unless the author said
-    /// otherwise". Audio and the Environment keep going, because that is what
-    /// they have always done on device and an ambience that cut out at every
-    /// boundary by default would be the wrong surprise.
+    /// Inside a looping Area, video loops with the Area by default
+    /// (`behavior == nil`, or an explicit Loop); a video's own Hold, Keep
+    /// Playing or Stop still wins. SOUND follows the OD-99 rule: it loops
+    /// with the Area unless the clip is set to Stop, or to Fade out on exit
+    /// (which leaves it running so it can fade as the viewer leaves). A
+    /// sound's Hold or Keep Playing does NOT opt out: it loops with the Area.
+    /// The Mac preview applies the same rule
+    /// (`SequencePlaybackController.heldAudioPolicy(for:)`). An Environment
+    /// cue follows the authored clock and is never looped by the Area. A
+    /// play-once Area and a Cue wait outside an Area use `command(for:on:)`
+    /// and `defaultCommand(on:)`.
+    public static func areaLoopCommand(for behavior: StoryContinuationBehavior?,
+                                       exitFade: TimeInterval?,
+                                       on content: Content) -> Command {
+        let fades = (exitFade ?? 0) > 0
+        switch (behavior, content) {
+        case (.stop?, .audio):
+            return .stop
+        case (nil, .audio), (.loop?, .audio), (.hold?, .audio), (.continue?, .audio):
+            return fades ? .leaveRunning : .loopWithArea
+        case (nil, .video), (.loop?, .video):
+            return .loopWithArea
+        case (nil, .backdrop), (.loop?, .backdrop):
+            return .leaveRunning
+        case (.hold?, _), (.continue?, _), (.stop?, _):
+            // `command(for:on:)` never answers `.loopWithArea` for these.
+            return command(for: behavior ?? .hold, on: content)
+        }
+    }
+
+    /// What content does when the author said NOTHING about it, in a
+    /// PLAY-ONCE Area (a looping Area: `areaLoopCommand(for: nil, ...)`).
+    ///
+    /// Video holds its frame. Audio and the Environment keep going, because
+    /// that is what they have always done on device and an ambience that cut
+    /// out at every boundary by default would be the wrong surprise.
     public static func defaultCommand(on content: Content) -> Command {
         switch content {
         case .video:            return .pause
@@ -101,7 +137,8 @@ public enum StoryHoldPlan {
     public static let audioHoldUnverifiedNotice =
         "Pausing one sound during an Explore Area has not been verified on Vision Pro. Use Stop or Fade out on exit."
 
-    /// Media cannot start looping at the boundary. See `docs/STORY_REGIONS.md` §6.
+    /// Media loops with a LOOPING Area only. In a play-once Area there is no
+    /// loop to join. See `docs/STORY_REGIONS.md` §6.
     public static let mediaLoopRefusal =
-        "Video and audio cannot start looping during an Explore Area. Set the clip to loop, then choose Keep Playing."
+        "Video and audio loop only in a looping Explore Area. Set the Area to loop, or set the clip to loop and choose Keep Playing."
 }

@@ -46,6 +46,48 @@ public struct SequenceStatus: Sendable {
     public let activeZones: Int?
 }
 
+// MARK: - While waiting at a Cue (OD-87, OD-99)
+
+/// One running media occurrence that has a say over an ordinary Cue wait:
+/// the channel it plays on and what it does while the story waits there.
+///
+/// Built only by `SequenceEngine.cueWaitMedia(in:throughSegment:insideArea:)`,
+/// which reads the authored setting through `CueWaitMedia.resolved`, so the
+/// behavior here is always `.hold` (freeze) or `.stop`. A clip that keeps
+/// playing (the default, and every document written before OD-87) is not
+/// listed at all: nothing is asked of it.
+public struct CueWaitMediaEntry: Equatable, Sendable {
+    public enum Medium: String, Sendable { case video, audio }
+    public let medium: Medium
+    public let channel: String
+    public let behavior: StoryContinuationBehavior
+
+    public init(medium: Medium, channel: String, behavior: StoryContinuationBehavior) {
+        self.medium = medium
+        self.channel = channel
+        self.behavior = behavior
+    }
+}
+
+/// What the engine asks of the media players during an ordinary Cue wait.
+///
+/// Optional: when nothing is wired the engine reaches the shipped players
+/// itself (`VideoPlaybackManager.holdForCueWait` through `VideoActionExecutor`,
+/// and `SpatialAudioManager`'s per-channel hold through `AudioActionExecutor`).
+/// A host or a test that drives its own players supplies this instead.
+@MainActor
+public protocol CueWaitMediaHolding: AnyObject {
+    /// Freeze a running video channel on its frame. False when there is no
+    /// such channel, so nothing records a hold nobody will release.
+    @discardableResult func holdVideoForCueWait(channel: String) -> Bool
+    /// Let a frozen video channel go. `resume` is false while the transport
+    /// itself is paused (its Resume restarts the channel) and on a teardown.
+    func releaseVideoCueWaitHold(channel: String, resume: Bool)
+    /// Pause a sounding audio channel, keeping its position.
+    @discardableResult func holdAudioForCueWait(channel: String) -> Bool
+    func releaseAudioCueWaitHold(channel: String, resume: Bool)
+}
+
 @MainActor
 @Observable
 public final class SequenceEngine {
@@ -86,6 +128,32 @@ public final class SequenceEngine {
     public private(set) var isWaiting: Bool = false
     public private(set) var currentGate: SegmentGate?
     public private(set) var waitStartTime: Date?
+
+    /// The media occurrences the current Cue wait froze (OD-87), released
+    /// when the wait ends. Empty outside a wait.
+    public private(set) var cueWaitHeldMedia: [CueWaitMediaEntry] = []
+
+    // MARK: - Memory crossed this visit (OD-98)
+
+    /// Where one segment action is authored: the Segment's index and the
+    /// action's place in that Segment's fire order (its opening actions,
+    /// then its scheduled ones as `scheduledInFireOrder` lists them). The
+    /// segment loop and the seek pre-fire number actions the same way.
+    private struct AuthoredSlot: Hashable {
+        let segment: Int
+        let slot: Int
+    }
+
+    /// THE MEMORY CHANGES THIS VISIT HAS ALREADY CROSSED (OD-98).
+    ///
+    /// A seek or a jump back never applies one of these again, and neither
+    /// does playing on through it afterwards: a viewer never gets a key or a
+    /// point twice, which is what the Mac preview does. A change the visit
+    /// has not reached yet still applies when a seek forward passes it,
+    /// because a later story-condition Cue may wait on it. A new visit (any
+    /// `play`: a Go To, a Return, a Restart) starts with none crossed; a
+    /// Return's Memory is the host's to restore (OD-98, Resume half).
+    @ObservationIgnored private var crossedMemoryActions: Set<AuthoredSlot> = []
 
     // MARK: - Timing
 
@@ -176,6 +244,17 @@ public final class SequenceEngine {
     /// waits for now hold. It never seeds it and never clears it — `play` begins
     /// a Sequence VISIT, and a visit is not a session.
     public weak var storyState: StoryStateStore?
+
+    /// THE AUTHORED SEQUENCE, by id, for what the runtime shape does not
+    /// carry: each media occurrence's "while waiting at a Cue" setting
+    /// (OD-87). Wired by the host from the document it plays; unwired, or
+    /// answering nil, every clip keeps playing through a Cue wait, which is
+    /// what every Chapter did before the setting existed.
+    public var sequenceDTOProvider: ((String) -> SequenceDefinitionDTO?)?
+
+    /// Overrides how a Cue wait freezes media (see `CueWaitMediaHolding`).
+    /// Nil uses the shipped players behind the wired executors.
+    public weak var cueWaitMediaHolder: CueWaitMediaHolding?
 
     /// Follows the sequence's timed backdrop track. Hung off the engine rather
     /// than owned by it: the engine's business is segments, gates and actions,
@@ -273,6 +352,11 @@ public final class SequenceEngine {
 
         logger.info("Playing sequence: \(sequence.id) from segment index \(clampedStart)/\(segmentCount) (\(String(format: "%.1f", sequence.totalDuration))s total)")
 
+        // A NEW VISIT: nothing is crossed yet, and the entry is counted
+        // before anything at t=0 can read the count.
+        crossedMemoryActions.removeAll()
+        countEntry(of: sequence)
+
         // THE HOST LEARNS WHICH SEQUENCE THIS IS BEFORE ANYTHING IS PRESENTED
         // FOR IT. `registerSequenceAnimation` begins the backdrop and caption
         // drivers, and a backdrop presented while the host still held the
@@ -318,6 +402,10 @@ public final class SequenceEngine {
 
         logger.info("Playing sequence (await): \(sequence.id) from segment index \(clampedStart)/\(segmentCount) (\(String(format: "%.1f", sequence.totalDuration))s total)")
 
+        // A NEW VISIT, exactly as `play` (see there).
+        crossedMemoryActions.removeAll()
+        countEntry(of: sequence)
+
         // THE HOST LEARNS WHICH SEQUENCE THIS IS BEFORE ANYTHING IS PRESENTED
         // FOR IT. `registerSequenceAnimation` begins the backdrop and caption
         // drivers, and a backdrop presented while the host still held the
@@ -336,6 +424,28 @@ public final class SequenceEngine {
         startStatusReporting()
 
         return await runSegmentsFrom(index: clampedStart, in: sequence)
+    }
+
+    /// COUNT ONE ENTRY OF `sequence` (OD-97).
+    ///
+    /// Every route into a Sequence passes through `play` or `playAndAwait`
+    /// exactly once: a Go To, a Return (resumed or restarted), a Restart and
+    /// a Chapter's first Sequence alike. A jump or a seek inside the visit
+    /// does not come here, so it counts nothing. The mutations are
+    /// ChapterScript's (`StoryStateDefinition.entryMutations`), shared with
+    /// the Mac preview, and they go through the session's one Memory write
+    /// path, so a story-condition Cue waiting on the count is re-asked.
+    private func countEntry(of sequence: SequenceDefinition) {
+        guard let store = storyState, store.isSessionActive else { return }
+        let definitions = store.ledger.snapshot.map { $0.definition }
+        let mutations = StoryStateDefinition.entryMutations(enteringSequence: sequence.id,
+                                                            in: definitions)
+        for mutation in mutations {
+            store.apply(mutation)
+        }
+        if !mutations.isEmpty {
+            logger.info("[story] entry of \(sequence.id, privacy: .public) counted in \(mutations.count) Memory Number(s)")
+        }
     }
 
     /// Hand the sequence's animation tracks to the entity executor, clocked
@@ -522,6 +632,8 @@ public final class SequenceEngine {
         pauseStartTime = nil
         resumeIfPaused()
         clearGate()
+        // The visit is over; the next one starts with nothing crossed.
+        crossedMemoryActions.removeAll()
 
         // Clear audio completion tracking
         audioCompletionActions.removeAll()
@@ -670,6 +782,17 @@ public final class SequenceEngine {
         cleanup(resetEntities: true)
     }
 
+    /// THE ONE OD-98 TEST. True for every action but a Memory change this
+    /// visit has already crossed at `slot`; records the crossing.
+    private func firstCrossing(_ action: SegmentAction, at slot: AuthoredSlot) -> Bool {
+        guard case .setStoryState(let mutation) = action else { return true }
+        guard crossedMemoryActions.insert(slot).inserted else {
+            logger.info("[story] \(mutation.stateId, privacy: .public): already applied this visit; a seek or jump back does not apply it again")
+            return false
+        }
+        return true
+    }
+
     /// Fire one action from an EARLIER Segment as part of a seek.
     ///
     /// The ordinary dispatch, minus the two things that are events rather
@@ -677,16 +800,19 @@ public final class SequenceEngine {
     /// them away — they are here — and replaying it would leave the Sequence
     /// being sought in. A spark burst is a one-shot that ended long ago.
     ///
-    /// `setStoryState` IS replayed: a later story-condition gate waits on
-    /// what an earlier Segment remembered, and a seek past the Segment that
-    /// set it would otherwise park the story for good.
-    private func preFire(_ action: SegmentAction) {
+    /// `setStoryState` applies only if this visit has NOT crossed it yet
+    /// (OD-98): a seek forward past a change the story never reached applies
+    /// it, because a later story-condition gate may wait on it, and a seek
+    /// back, or a seek to where the clock already is, never applies one the
+    /// viewer already got. `slot` is where the action is authored.
+    private func preFire(_ action: SegmentAction, at slot: AuthoredSlot) {
         switch action {
         case .navigate, .startSparkBurst:
             return
         default:
             // Synchronous on purpose: `executeAction` has no async case today
             // and falls through to this same dispatch.
+            guard firstCrossing(action, at: slot) else { return }
             executeActionSync(action)
         }
     }
@@ -863,7 +989,7 @@ public final class SequenceEngine {
             let timed: [(TimeInterval, SegmentAction)] =
                 segment.actions.map { (0, $0) }
                 + Self.scheduledInFireOrder(segment).map { (min($0.at, segment.duration), $0.action) }
-            for (at, action) in timed {
+            for (slot, (at, action)) in timed.enumerated() {
                 defer { position += 1 }
                 guard !superseded.contains(position) else { continue }
                 // PARK THE AUTHORED CLOCK ON THE ACTION'S OWN INSTANT. The
@@ -872,7 +998,7 @@ public final class SequenceEngine {
                 // progress rather than starting now.
                 segmentStartTime = Date.now.addingTimeInterval(-at)
                 currentFiringOffset = at
-                preFire(action)
+                preFire(action, at: AuthoredSlot(segment: index, slot: slot))
             }
         }
 
@@ -931,7 +1057,23 @@ public final class SequenceEngine {
             entityExecutor?.clearSegmentMotions()
 
             currentFiringOffset = 0
-            await executeActions(segment.actions)
+#if DEBUG
+            if index == 0 {
+                segmentSignposter.emitEvent("segment1_dispatch")
+            }
+#endif
+            // Each at its authored slot (OD-98): opening actions are slots
+            // 0..<count, scheduled ones follow in fire order.
+            // Synchronous actions are not awaited, as `executeActions`
+            // never awaited them: no MainActor suspension point.
+            for (slot, action) in segment.actions.enumerated() {
+                guard firstCrossing(action, at: AuthoredSlot(segment: index, slot: slot)) else { continue }
+                if action.isAsync {
+                    await executeAction(action)
+                } else {
+                    executeActionSync(action)
+                }
+            }
             let actionsElapsed = Date.now.timeIntervalSince(segmentStartTime) - enteredAt
             logger.info("executeActions: \(String(format: "%.3f", actionsElapsed))s for segment \(segment.id)")
             onSegmentChanged?(segment, index)
@@ -954,6 +1096,9 @@ public final class SequenceEngine {
             // so the editor and the runtime agree on what happens first.
             let scheduledInFireOrder = Self.scheduledInFireOrder(segment)
             var nextScheduled = 0
+            // OD-63: the signpost interval open for the action the loop is
+            // waiting on, so it spans scheduled-to-fired.
+            var armedActionInterval: (index: Int, state: OSSignpostIntervalState)?
 
             // An action stored past its Segment's end is late, not lost: the
             // boundary drain below fires it. Say so, because the document is
@@ -1002,14 +1147,36 @@ public final class SequenceEngine {
                 while nextScheduled < scheduledInFireOrder.count,
                       elapsedSinceSegmentStart >= scheduledInFireOrder[nextScheduled].at {
                     let scheduled = scheduledInFireOrder[nextScheduled]
+                    let firedIndex = nextScheduled
                     nextScheduled += 1
                     let lateMs = (Date.now.timeIntervalSince(segmentStartTime) - segmentPausedDuration - scheduled.at) * 1000
-                    logger.notice("[timing] action at +\(String(format: "%.3f", scheduled.at))s fired \(String(format: "%.0f", lateMs)) ms late (segment \(segment.id, privacy: .public))")
-                    currentFiringOffset = scheduled.at
-                    if scheduled.action.isAsync {
-                        await executeAction(scheduled.action)
+                    // OD-63: routine at `.debug`, a saved `.error` only when
+                    // the action is clearly late, and the interval that
+                    // measures it in Release.
+                    let timingLevel = PlaybackDiagnostics.timingLevel(
+                        lateMilliseconds: lateMs, catchingUp: catchingUpTo != nil)
+                    logger.log(level: timingLevel, "[timing] action at +\(scheduled.at, format: .fixed(precision: 3))s fired \(lateMs, format: .fixed(precision: 0)) ms late (segment \(segment.id, privacy: .public))")
+                    let interval: OSSignpostIntervalState
+                    if let armed = armedActionInterval, armed.index == firedIndex {
+                        interval = armed.state
                     } else {
-                        executeActionSync(scheduled.action)
+                        interval = PlaybackDiagnostics.signposter.beginInterval(
+                            "Action Scheduled to Fired",
+                            id: PlaybackDiagnostics.signposter.makeSignpostID(),
+                            "at +\(scheduled.at, format: .fixed(precision: 3))s")
+                    }
+                    armedActionInterval = nil
+                    PlaybackDiagnostics.signposter.endInterval(
+                        "Action Scheduled to Fired", interval,
+                        "late \(lateMs, format: .fixed(precision: 0)) ms")
+                    currentFiringOffset = scheduled.at
+                    let slot = AuthoredSlot(segment: index, slot: segment.actions.count + firedIndex)
+                    if firstCrossing(scheduled.action, at: slot) {
+                        if scheduled.action.isAsync {
+                            await executeAction(scheduled.action)
+                        } else {
+                            executeActionSync(scheduled.action)
+                        }
                     }
                 }
 
@@ -1032,12 +1199,28 @@ public final class SequenceEngine {
                 // housekeeping cadence (status, Explore) stays the ceiling.
                 var sleepTime = min(remaining, 0.25)
                 if nextScheduled < scheduledInFireOrder.count {
+                    // OD-63: the interval opens once, when the engine first
+                    // arms its wake for this action, and closes where it fires.
+                    if armedActionInterval?.index != nextScheduled {
+                        let armedIndex = nextScheduled
+                        let armedAt = scheduledInFireOrder[armedIndex].at
+                        armedActionInterval = (armedIndex, PlaybackDiagnostics.signposter.beginInterval(
+                            "Action Scheduled to Fired",
+                            id: PlaybackDiagnostics.signposter.makeSignpostID(),
+                            "at +\(armedAt, format: .fixed(precision: 3))s"))
+                    }
                     let now = Date.now.timeIntervalSince(segmentStartTime) - segmentPausedDuration
                     sleepTime = min(sleepTime, max(0.002, scheduledInFireOrder[nextScheduled].at - now))
                 }
                 try? await Task.sleep(for: .seconds(sleepTime))
                 remaining = timeLeft()
             } while remaining > 0
+            // An action the loop armed but did not fire is fired by the
+            // boundary drain below, or never; either way its interval ends here.
+            if let armed = armedActionInterval {
+                PlaybackDiagnostics.signposter.endInterval(
+                    "Action Scheduled to Fired", armed.state, "left the timing loop")
+            }
 
             // THE BOUNDARY DRAIN. The due check sits at the TOP of the body
             // and the loop exits after its final sleep WITHOUT running it
@@ -1050,13 +1233,17 @@ public final class SequenceEngine {
             while nextScheduled < scheduledInFireOrder.count {
                 guard !Task.isCancelled else { return nil }
                 let scheduled = scheduledInFireOrder[nextScheduled]
+                let drainedIndex = nextScheduled
                 nextScheduled += 1
                 logger.info("Scheduled action fired at the boundary of segment \(segment.id) (authored at +\(String(format: "%.2f", scheduled.at))s of \(String(format: "%.2f", segment.duration))s)")
                 currentFiringOffset = min(scheduled.at, segment.duration)
-                if scheduled.action.isAsync {
-                    await executeAction(scheduled.action)
-                } else {
-                    executeActionSync(scheduled.action)
+                let slot = AuthoredSlot(segment: index, slot: segment.actions.count + drainedIndex)
+                if firstCrossing(scheduled.action, at: slot) {
+                    if scheduled.action.isAsync {
+                        await executeAction(scheduled.action)
+                    } else {
+                        executeActionSync(scheduled.action)
+                    }
                 }
             }
 
@@ -1153,6 +1340,11 @@ public final class SequenceEngine {
         // THE GATE RESOLVED, so its detection, its accessible equivalent and
         // its drawn Prompt (OD-38) go with it, as `GateDetecting` promises.
         gateDetector?.gateDidEnd()
+        // The frozen clips go on from their frame. While the transport is
+        // paused the hold is only dropped, and the transport's own resume
+        // (just below, or the person's later) restarts them with everything
+        // else.
+        endCueWaitMedia(resume: !isPaused)
         gateContinuation?.resume()
         gateContinuation = nil
         if resumingPlayback, isPaused {
@@ -1208,6 +1400,10 @@ public final class SequenceEngine {
         currentGate = gate
         waitStartTime = .now
         logger.info("Gate activated: \(gate.type.rawValue), timeout=\(gate.timeout.map { String($0) } ?? "none")")
+
+        // WHILE WAITING AT A CUE (OD-87): each running clip does what its
+        // own setting says, freeze or stop; one left alone keeps playing.
+        beginCueWaitMedia()
 
         sendStatus()
         onGateStarted?(gate)
@@ -1290,8 +1486,131 @@ public final class SequenceEngine {
         // A stop, a jump or a seek ends the wait: the Cue's detection and its
         // drawn Prompt go too.
         gateDetector?.gateDidEnd()
+        // Every caller tears the media down next; nothing is restarted here.
+        endCueWaitMedia(resume: false)
         gateContinuation?.resume()
         gateContinuation = nil
+    }
+
+    // MARK: - While waiting at a Cue (OD-87, OD-99)
+
+    /// WHAT EACH RUNNING CLIP DOES DURING A CUE WAIT that ends `index`'s
+    /// Segment. PURE: reads only the authored Sequence.
+    ///
+    /// Walks every Segment up to and including `index` in fire order and keeps,
+    /// per channel, the last play no stop has ended: the occurrence that is
+    /// running when the story parks at the boundary. Its setting is read
+    /// through `CueWaitMedia.resolved`, so a clip with no setting (every
+    /// document written before OD-87) keeps playing and is not listed, and
+    /// INSIDE an Explore Area nothing is listed at all: the Area's own rules
+    /// govern there (OD-99). Sorted video first, then by channel, so the order
+    /// never depends on a dictionary.
+    public static func cueWaitMedia(in sequence: SequenceDefinitionDTO,
+                                    throughSegment index: Int,
+                                    insideArea: Bool) -> [CueWaitMediaEntry] {
+        guard !insideArea, sequence.segments.indices.contains(index) else { return [] }
+        var video: [String: StoryContinuationBehavior] = [:]
+        var audio: [String: StoryContinuationBehavior] = [:]
+        for segment in sequence.segments[...index] {
+            let ordered = segment.authoredActions.enumerated().sorted { a, b in
+                FireOrder.precedes(at: max(0, a.element.at), closes: a.element.action.endsAnOccurrence,
+                                   offset: a.offset,
+                                   before: max(0, b.element.at), closes: b.element.action.endsAnOccurrence,
+                                   offset: b.offset)
+            }
+            for authored in ordered {
+                switch authored.element.action {
+                case .playVideo(let clip):
+                    video[clip.channel] = CueWaitMedia.resolved(clip.cueWaitBehavior, insideArea: false) ?? .continue
+                case .stopVideo(let channel):
+                    video[channel] = nil
+                case .playAudio(let clip):
+                    audio[clip.channel] = CueWaitMedia.resolved(clip.cueWaitBehavior, insideArea: false) ?? .continue
+                case .stopAudio(let channel):
+                    audio[channel] = nil
+                default:
+                    break
+                }
+            }
+        }
+        func entries(_ map: [String: StoryContinuationBehavior],
+                     _ medium: CueWaitMediaEntry.Medium) -> [CueWaitMediaEntry] {
+            map.keys.sorted().compactMap { channel in
+                guard let behavior = map[channel], behavior == .hold || behavior == .stop else { return nil }
+                return CueWaitMediaEntry(medium: medium, channel: channel, behavior: behavior)
+            }
+        }
+        return entries(video, .video) + entries(audio, .audio)
+    }
+
+    /// Apply each running clip's Cue-wait setting as a wait begins.
+    private func beginCueWaitMedia() {
+        cueWaitHeldMedia = []
+        guard let sequence = currentSequence,
+              let authored = sequenceDTOProvider?(sequence.id) else { return }
+        let insideArea = storyRegions?.active != nil
+        for entry in Self.cueWaitMedia(in: authored, throughSegment: currentSegmentIndex,
+                                       insideArea: insideArea) {
+            switch entry.behavior {
+            case .hold:
+                if holdForCueWait(entry) {
+                    cueWaitHeldMedia.append(entry)
+                    logger.info("[cue] \(entry.medium.rawValue, privacy: .public) channel '\(entry.channel, privacy: .public)' freezes while the story waits")
+                }
+            case .stop:
+                logger.info("[cue] \(entry.medium.rawValue, privacy: .public) channel '\(entry.channel, privacy: .public)' stops while the story waits")
+                switch entry.medium {
+                case .video: videoExecutor?.stop(channel: entry.channel)
+                case .audio: audioExecutor?.stop(channel: entry.channel)
+                }
+            case .continue, .loop:
+                break
+            }
+        }
+    }
+
+    /// Release what the wait froze. A stopped clip stays stopped: its
+    /// occurrence ended at the Cue, as an Explore Stop does.
+    private func endCueWaitMedia(resume: Bool) {
+        guard !cueWaitHeldMedia.isEmpty else { return }
+        let held = cueWaitHeldMedia
+        cueWaitHeldMedia = []
+        for entry in held {
+            if let media = cueWaitMediaHolder {
+                switch entry.medium {
+                case .video: media.releaseVideoCueWaitHold(channel: entry.channel, resume: resume)
+                case .audio: media.releaseAudioCueWaitHold(channel: entry.channel, resume: resume)
+                }
+                continue
+            }
+            switch entry.medium {
+            case .video:
+                (videoExecutor as? VideoActionExecutor)?.videoManager
+                    .releaseCueWaitHold(channel: entry.channel, resume: resume)
+            case .audio:
+                // Outside an Area there is no Explore hold on any channel, so
+                // the audio manager's one per-channel hold serves the Cue.
+                (audioExecutor as? AudioActionExecutor)?.audioManager
+                    .releaseExploreHold(channel: entry.channel, resume: resume)
+            }
+        }
+    }
+
+    private func holdForCueWait(_ entry: CueWaitMediaEntry) -> Bool {
+        if let media = cueWaitMediaHolder {
+            switch entry.medium {
+            case .video: return media.holdVideoForCueWait(channel: entry.channel)
+            case .audio: return media.holdAudioForCueWait(channel: entry.channel)
+            }
+        }
+        switch entry.medium {
+        case .video:
+            return (videoExecutor as? VideoActionExecutor)?.videoManager
+                .holdForCueWait(channel: entry.channel) ?? false
+        case .audio:
+            return (audioExecutor as? AudioActionExecutor)?.audioManager
+                .pauseForExploreHold(channel: entry.channel) ?? false
+        }
     }
 
     // MARK: - Scheduled Actions
@@ -1592,6 +1911,11 @@ public final class SequenceEngine {
             // notifies — and that notification is what re-asks a waiting
             // story-condition gate. ONE path, so a mutation applied from
             // anywhere else (a host, a future action) releases a boundary too.
+            //
+            // A Segment's own change reaches here once per visit: the
+            // Segment dispatch (`firstCrossing`) drops one already crossed
+            // (OD-98). An Interaction response or an `onAudioComplete`
+            // follow-up is not a Segment's and always applies.
             storyState?.apply(mutation)
 
         // System UI — no-ops at this level (wire in SharedVisionsApp if needed)

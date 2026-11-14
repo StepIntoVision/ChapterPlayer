@@ -2,8 +2,10 @@
 //  ParticleEmitterEntity.swift
 //  ChapterPlayer
 //
-//  Real particle rendering for `.particles`-kind entities. An entity
-//  definition carries only a `particlePresetId`; the document's
+//  Real particle rendering for `.particles`-kind entities, and for a preset
+//  attached to any other Object (OD-80: `attachParticles`, the emitter on the
+//  Object's own entity). An entity definition carries only a
+//  `particlePresetId`; the document's
 //  `particlePresets` array holds the full-fidelity `ParticleEmitterPreset`
 //  (ChapterScript) that the editors author. This file maps that format
 //  preset onto RealityKit's `ParticleEmitterComponent`, mirroring Maestro's
@@ -68,6 +70,35 @@ extension EntityFactory {
             return entity
         }
 
+        installParticleEmitter(preset, on: entity)
+        return entity
+    }
+
+    /// A PRESET ATTACHED TO ANY OTHER OBJECT (OD-80).
+    ///
+    /// The editors let a Craft preset attach to a model, a primitive, a
+    /// Title, a light, an image or a screen without changing what that Object
+    /// is: its definition keeps its own kind and gains a `particlePresetId`.
+    /// The emitter goes on the Object's OWN entity, exactly where the Mac
+    /// Viewer puts it (`SceneViewport.syncAttachedEmitter`), so it moves,
+    /// scales, shows and hides with the Object, and a non-looping preset's
+    /// burst fires when the Object is shown, through the same
+    /// `ParticleBurstOnRevealComponent` the executor already reads.
+    ///
+    /// An unknown preset id leaves the Object exactly as it was built: the
+    /// Object is the content, the emitter only decorates it.
+    func attachParticles(_ def: EntityDefinition, to entity: Entity) {
+        guard def.kind != .particles, let presetId = def.particlePresetId else { return }
+        guard let preset = particlePresets[presetId] else {
+            particleLogger.warning("Entity '\(def.id)' attaches unknown preset '\(presetId)'; drawing it without particles")
+            return
+        }
+        installParticleEmitter(preset, on: entity)
+    }
+
+    /// THE ONE INSTALL, shared by an emitter Object and a preset attached to
+    /// any other Object, so the two can never draw the same preset two ways.
+    private func installParticleEmitter(_ preset: ParticleEmitterPreset, on entity: Entity) {
         entity.components.set(ParticleEmitterComponent(preset: preset))
         if !preset.loops {
             entity.components.set(ParticleBurstOnRevealComponent())
@@ -86,7 +117,6 @@ extension EntityFactory {
                 entity.components.set(emitter)
             }
         }
-        return entity
     }
 }
 

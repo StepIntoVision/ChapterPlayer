@@ -3,7 +3,10 @@
 //  SharedVisions
 //
 //  Handles entity show/hide/move/scale/fade/reveal/gesture/persist actions from SequenceEngine.
-//  Wraps RealityKit Entity manipulation.
+//  Wraps RealityKit Entity manipulation. Moves, Scales, Fades and a Reveal's
+//  fade-in are computed per frame from ChapterScript's canonical curve
+//  (`MotionCurveSampling.actionProgress`, OD-52), not fired as RealityKit
+//  animations; see `applyActionTweens`.
 //
 
 import RealityKit
@@ -125,6 +128,8 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     public func unregister(name: String) {
         entityRegistry.removeValue(forKey: name)
         originalTransforms.removeValue(forKey: name)
+        transformTweens.removeValue(forKey: name)
+        opacityTweens.removeValue(forKey: name)
     }
 
     /// Re-baseline the reset pose for `name` to a new AUTHORED transform.
@@ -184,6 +189,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         }
 
         let timing = action.timing.animationTimingFunction
+        let canonicalTiming = Self.canonicalTiming(action.timing)
 
         if let headOffset = action.headRelativePosition {
             let worldTarget = resolveHeadWorldPosition(offset: headOffset, headYOnly: action.headYOnly)
@@ -209,7 +215,14 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                 translation: worldTarget
             )
 
-            entity.move(to: targetTransform, relativeTo: nil, duration: action.duration, timingFunction: timing)
+            // SAMPLED PER FRAME on the canonical curve (OD-52), in WORLD space
+            // because the target was resolved there. RealityKit's own easing is
+            // only the fallback when no authored clock is installed.
+            if !startTransformTween(on: entity, name: action.entity, to: targetTransform,
+                                    world: true, duration: action.duration,
+                                    timing: canonicalTiming) {
+                entity.move(to: targetTransform, relativeTo: nil, duration: action.duration, timingFunction: timing)
+            }
 
             let mode = action.headYOnly ? "headYOnly" : "headRelative"
             logger.debug("Move entity (\(mode)): \(action.entity) offset=\(headOffset) → world=\(worldTarget)")
@@ -243,7 +256,11 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
                 translation: targetPosition
             )
 
-            entity.move(to: targetTransform, relativeTo: entity.parent, duration: action.duration, timingFunction: timing)
+            if !startTransformTween(on: entity, name: action.entity, to: targetTransform,
+                                    world: false, duration: action.duration,
+                                    timing: canonicalTiming) {
+                entity.move(to: targetTransform, relativeTo: entity.parent, duration: action.duration, timingFunction: timing)
+            }
 
             logger.debug("Move entity: \(action.entity) over \(String(format: "%.1f", action.duration))s")
         }
@@ -261,12 +278,15 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             translation: entity.position(relativeTo: entity.parent)
         )
 
-        entity.move(
-            to: targetTransform,
-            relativeTo: entity.parent,
-            duration: duration,
-            timingFunction: timing.animationTimingFunction
-        )
+        if !startTransformTween(on: entity, name: name, to: targetTransform, world: false,
+                                duration: duration, timing: Self.canonicalTiming(timing)) {
+            entity.move(
+                to: targetTransform,
+                relativeTo: entity.parent,
+                duration: duration,
+                timingFunction: timing.animationTimingFunction
+            )
+        }
 
         logger.debug("Scale entity: \(name) by \(multiplier)× over \(String(format: "%.1f", duration))s")
     }
@@ -276,7 +296,11 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             logger.warning("fadeEntity: '\(action.entity)' not found in registry")
             return
         }
-        entity.fadeOpacity(to: action.opacity, duration: action.duration, timing: action.timing.animationTimingFunction)
+        if !startOpacityTween(on: entity, name: action.entity, to: action.opacity,
+                              duration: action.duration,
+                              timing: Self.canonicalTiming(action.timing)) {
+            entity.fadeOpacity(to: action.opacity, duration: action.duration, timing: action.timing.animationTimingFunction)
+        }
         logger.debug("Fade entity: \(action.entity) to opacity \(action.opacity) over \(String(format: "%.1f", action.duration))s")
     }
 
@@ -287,7 +311,13 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         }
 
         // 1. Snap invisible (synchronous — no frame rendered between this and enable)
+        opacityTweens.removeValue(forKey: action.entity)
         entity.fadeOpacity(to: 0, duration: 0)
+        // A Reveal that PLACES the entity ends any Move still in flight on it,
+        // or the next frame's sample would carry it off the placement.
+        if action.headRelativePosition != nil || action.position != nil || action.scale != nil {
+            transformTweens.removeValue(forKey: action.entity)
+        }
 
         // 2. Position
         if let headOffset = action.headRelativePosition {
@@ -319,8 +349,14 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         // 4. Enable (still invisible — opacity 0)
         entity.isEnabled = true
 
-        // 5. Fade in (or cut-in if duration == 0)
-        entity.fadeOpacity(to: 1.0, duration: action.fadeIn)
+        // 5. Fade in (or cut-in if duration == 0), on the CANONICAL REVEAL
+        //    CURVE (`MotionCurveSampling.revealTiming`, OD-52), sampled per
+        //    frame. RealityKit's `.easeInOut` is only the no-clock fallback.
+        if !startOpacityTween(on: entity, name: action.entity, to: 1.0,
+                              duration: action.fadeIn,
+                              timing: MotionCurveSampling.revealTiming) {
+            entity.fadeOpacity(to: 1.0, duration: action.fadeIn)
+        }
 
         // 6. Optional hand manipulation — make the entity grabbable /
         //    movable / rotatable / scalable by the viewer. RealityKit's
@@ -402,6 +438,143 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         logger.info("Reset all entity transforms and disabled non-persisted entities")
     }
 
+    // MARK: - Timed actions sampled per frame (OD-52)
+
+    /// A Move or Scale in flight, sampled every frame on the AUTHORED Sequence
+    /// clock from ChapterScript's canonical curve.
+    ///
+    /// THE HEADSET COMPUTES THE POSE; IT NO LONGER FIRES REALITYKIT'S EASING.
+    /// The owner decided (2026-11-14, OD-52) that the Mac's quadratic curve is
+    /// canonical. `entity.move(to:duration:timingFunction:)` eased with
+    /// RealityKit's `.easeInOut`, a different shape, and ran on wall time, so
+    /// it also kept going while a gate or a pause held the authored clock.
+    /// `MotionCurveSampling.actionProgress` is the function the Mac compositor
+    /// and MaestroKit's `ScrubCompositor` call for the same action.
+    private struct TransformTween {
+        let startedAt: TimeInterval
+        let duration: TimeInterval
+        let timing: ChapterScript.SegmentTimingFunction
+        let from: Transform
+        let to: Transform
+        /// True when `from` and `to` are WORLD space (a head-relative Move,
+        /// whose target was resolved there); otherwise parent space.
+        let world: Bool
+    }
+
+    /// A Fade or a Reveal's fade-in in flight, sampled like `TransformTween`.
+    private struct OpacityTween {
+        let startedAt: TimeInterval
+        let duration: TimeInterval
+        let timing: ChapterScript.SegmentTimingFunction
+        let from: Float
+        let to: Float
+    }
+
+    /// One in-flight transform action per entity: a new Move or Scale on the
+    /// same entity starts from where the old one has carried it, and replaces
+    /// it, as a second RealityKit `move(to:)` did.
+    private var transformTweens: [String: TransformTween] = [:]
+    /// One in-flight opacity action per entity, independent of the transform.
+    private var opacityTweens: [String: OpacityTween] = [:]
+
+    /// The runtime's own timing enum spelled as the format's, so the curve is
+    /// looked up in the ONE table. The raw values are the same strings.
+    private static func canonicalTiming(_ timing: SegmentTimingFunction) -> ChapterScript.SegmentTimingFunction {
+        ChapterScript.SegmentTimingFunction(rawValue: timing.rawValue) ?? .easeInOut
+    }
+
+    /// Start sampling a Move or Scale toward `target`. Returns false only when
+    /// no authored clock is installed, so the caller falls back to RealityKit's
+    /// animation rather than freezing the entity. An instant (duration no
+    /// longer than `MotionProgress.minimumDuration`) is assigned at once.
+    private func startTransformTween(
+        on entity: Entity, name: String, to target: Transform, world: Bool,
+        duration: TimeInterval, timing: ChapterScript.SegmentTimingFunction
+    ) -> Bool {
+        if duration <= MotionProgress.minimumDuration {
+            transformTweens.removeValue(forKey: name)
+            Self.write(target, to: entity, world: world)
+            return true
+        }
+        guard let now = animationClock?() else { return false }
+        let from = world
+            ? Transform(matrix: entity.transformMatrix(relativeTo: nil))
+            : entity.transform
+        transformTweens[name] = TransformTween(startedAt: now, duration: duration, timing: timing,
+                                               from: from, to: target, world: world)
+        return true
+    }
+
+    /// Start sampling a Fade (or a Reveal's fade-in) toward `target`, from the
+    /// entity's opacity now. Same fallback and instant rules as
+    /// `startTransformTween`.
+    private func startOpacityTween(
+        on entity: Entity, name: String, to target: Float,
+        duration: TimeInterval, timing: ChapterScript.SegmentTimingFunction
+    ) -> Bool {
+        if duration <= MotionProgress.minimumDuration {
+            opacityTweens.removeValue(forKey: name)
+            entity.opacity = target
+            return true
+        }
+        guard let now = animationClock?() else { return false }
+        opacityTweens[name] = OpacityTween(startedAt: now, duration: duration, timing: timing,
+                                           from: entity.opacity, to: target)
+        return true
+    }
+
+    private static func write(_ transform: Transform, to entity: Entity, world: Bool) {
+        if world {
+            entity.setTransformMatrix(transform.matrix, relativeTo: nil)
+        } else {
+            entity.transform = transform
+        }
+    }
+
+    /// Write every in-flight Move, Scale and Fade at the authored clock's now.
+    ///
+    /// A finished one writes its target exactly and is dropped. A clock that
+    /// reads EARLIER than a tween's start has been rebased (a seek, a new
+    /// Sequence on the same executor): that tween is finished at its target
+    /// rather than held at its start, which is where RealityKit's wall-time
+    /// animation would long since have left it.
+    private func applyActionTweens() {
+        guard !transformTweens.isEmpty || !opacityTweens.isEmpty,
+              let now = animationClock?() else { return }
+        for (name, tween) in transformTweens {
+            guard let entity = entityRegistry[name] else {
+                transformTweens.removeValue(forKey: name)
+                continue
+            }
+            let rebased = now < tween.startedAt
+            let done = rebased || MotionProgress.isComplete(startTime: tween.startedAt, now: now,
+                                                            duration: tween.duration)
+            let progress = done ? 1 : MotionCurveSampling.actionProgress(
+                startTime: tween.startedAt, now: now, duration: tween.duration, timing: tween.timing)
+            let pose = MotionCurveSampling.interpolatedPose(
+                from: (tween.from.translation, tween.from.rotation, tween.from.scale),
+                to: (tween.to.translation, tween.to.rotation, tween.to.scale),
+                progress: progress)
+            Self.write(Transform(scale: pose.scale, rotation: pose.rotation, translation: pose.position),
+                       to: entity, world: tween.world)
+            if done { transformTweens.removeValue(forKey: name) }
+        }
+        for (name, tween) in opacityTweens {
+            guard let entity = entityRegistry[name] else {
+                opacityTweens.removeValue(forKey: name)
+                continue
+            }
+            let rebased = now < tween.startedAt
+            let done = rebased || MotionProgress.isComplete(startTime: tween.startedAt, now: now,
+                                                            duration: tween.duration)
+            let progress = done ? 1 : MotionCurveSampling.actionProgress(
+                startTime: tween.startedAt, now: now, duration: tween.duration, timing: tween.timing)
+            entity.opacity = MotionCurveSampling.interpolatedOpacity(from: tween.from, to: tween.to,
+                                                                     progress: progress)
+            if done { opacityTweens.removeValue(forKey: name) }
+        }
+    }
+
     // MARK: - Active motion
 
     public func beginMotionBehavior(_ behavior: ChapterScript.MotionBehaviorDTO) {
@@ -429,6 +602,10 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
         }
         activeMotions.removeAll(keepingCapacity: true)
         activeBehaviors.removeAll(keepingCapacity: true)
+        // A reset assigns the rest pose; a Move or Fade still sampling would
+        // carry the entity straight off it on the next frame.
+        transformTweens.removeAll(keepingCapacity: true)
+        opacityTweens.removeAll(keepingCapacity: true)
     }
 
     /// A SEGMENT BOUNDARY ENDS A LEGACY MOTION AND DOES NOT END A BEHAVIOR.
@@ -604,6 +781,10 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
     }
 
     public func applyActiveMotions(segmentElapsed: TimeInterval, totalElapsed: TimeInterval) {
+        // Order is the editors' order (`ScrubCompositor`, the Mac compositor):
+        // timed actions, then the tracks that override them, then the motion
+        // layer on top.
+        applyActionTweens()
         applySequenceAnimationTracks()
         applyActiveBehaviors()
         guard !activeMotions.isEmpty else { return }

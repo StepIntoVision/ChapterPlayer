@@ -1926,6 +1926,73 @@ public class SpatialAudioManager {
         logger.info("[explore] audio channel '\(channel)' resumes")
     }
 
+    // MARK: - Explore Area loop (OD-25, OD-99)
+
+    /// RESTART ONE SOUND AT ITS PLACE IN A LOOPING EXPLORE AREA: `elapsed`
+    /// seconds into its occurrence. The Area's loop calls this at each of the
+    /// sound's starts, so a sound that runs past the Area's range is cut and
+    /// starts again with it.
+    ///
+    /// From its start (`elapsed` 0) every backend simply plays it again, the
+    /// ordinary `play(action:)`. Part-way through, only where the backend can
+    /// honestly start mid-sound:
+    ///
+    /// * head-locked and scene-based (AVAudioEngine): the marked window moved
+    ///   forward by `elapsed`, read from the master's own length, so a sound
+    ///   whose window is already over stays silent rather than replaying the
+    ///   whole file;
+    /// * an encoded master (the system player): played, then seeked once;
+    /// * a positional voice (RealityKit) and a sound that loops on its own:
+    ///   not restarted part-way; it keeps its own clock, and false says so.
+    ///
+    /// Returns false when nothing was started.
+    @discardableResult
+    public func playForAreaLoop(_ action: AudioAction, elapsed: TimeInterval) -> Bool {
+        guard elapsed > 0 else {
+            play(action: action, segmentContext: "explore-loop")
+            return true
+        }
+        guard !action.loop, action.loopConfig == nil else { return false }
+        switch action.routing.route {
+        case .positional:
+            return false
+        case .systemSpatialMedia:
+            play(action: action, segmentContext: "explore-loop")
+            systemSpatialMedia.seek(channel: action.channel, toElapsed: elapsed, masterDuration: nil)
+            return true
+        case .headLocked, .sceneBased:
+            guard let shifted = areaLoopAction(action, elapsed: elapsed) else {
+                // Its window is over at this point of the loop: silence.
+                stop(channel: action.channel)
+                return false
+            }
+            play(action: shifted, segmentContext: "explore-loop")
+            return true
+        }
+    }
+
+    /// `action` with its source window starting `elapsed` seconds later, no
+    /// fade in (it is joining part-way), or nil when the window is over.
+    private func areaLoopAction(_ action: AudioAction, elapsed: TimeInterval) -> AudioAction? {
+        guard let url = findAudioURL(file: action.file),
+              let file = try? AVAudioFile(forReading: url) else { return nil }
+        let rate = file.processingFormat.sampleRate
+        guard rate > 0, file.length > 0 else { return nil }
+        let master = Double(file.length) / rate
+        let start = action.sourceRange.resolvedIn + elapsed
+        let end = min(action.sourceRange.resolvedOut(masterDuration: master) ?? master, master)
+        guard end - start > 0.01 else { return nil }
+        return AudioAction(
+            file: action.file, channel: action.channel, scope: action.scope,
+            volume: action.volume, loop: action.loop, fadeIn: nil, fadeOut: action.fadeOut,
+            spatial: action.spatial, category: action.category, crossfade: nil,
+            loopConfig: action.loopConfig,
+            sourceRange: MediaSourceRange(sourceIn: start, sourceOut: end),
+            playbackModel: action.playbackModel,
+            spatialPresentation: action.spatialPresentation,
+            retime: action.retime, pitch: action.pitch)
+    }
+
     // MARK: - Fade
 
     /// Author a fade on `channel`.

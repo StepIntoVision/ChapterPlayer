@@ -2,7 +2,7 @@
 //  ComfortSignals.swift
 //  ChapterPlayer
 //
-//  WHAT THE SYSTEM IS TELLING US ABOUT COMFORT AND HEAT, SURFACED.
+//  WHAT THE SYSTEM IS TELLING US ABOUT COMFORT AND HEAT, AND WHAT THE STORY DOES.
 //
 //  Two signals the platform already sends and this runtime used to drop:
 //
@@ -13,12 +13,16 @@
 //       `.reduceImmersion`.
 //    2. `ProcessInfo.thermalStateDidChangeNotification`.
 //
-//  SURFACING IS THE WHOLE SCOPE. Nothing here changes playback quality, pauses
-//  a Sequence or sheds work — a response policy is a product decision that has
-//  to be made wearing a headset, and a runtime that quietly degrades on its
-//  own is a bug report nobody can reproduce. This publishes the latest facts
-//  and logs every change, so a host can show them and a device session can
-//  read them back out of the log.
+//  THE RESPONSE (OD-50, owner decision). When the system pauses or shrinks
+//  immersive video for the viewer's comfort, the WHOLE STORY pauses with it
+//  and a short calm message says so; when the system resumes playback, the
+//  story resumes with it. At very high heat (`.critical`) the viewer sees a
+//  warning only: nothing pauses. The decision is pure
+//  (`ComfortSignals.response(to:)`, `ComfortSignals.thermalWarning(for:)`);
+//  `ChapterPlayerCore` carries it out through `onResponse`, pausing the
+//  engine with the same `pause()`/`resume()` the transport uses. The message
+//  is drawn by `ComfortNoticePresenter`, on the caption recipe. Every change
+//  is still logged, so a device session can read it back out of the log.
 //
 //  The recording half is pure (`recordThermal`, `recordMitigation` take their
 //  inputs as values), so it is tested without a scene and without heating a
@@ -95,6 +99,56 @@ public final class ComfortSignals {
         }
     }
 
+    // MARK: - The response (OD-50)
+
+    /// What the player does about one comfort signal.
+    public enum Response: Sendable, Equatable {
+        /// Pause the whole story and show `message`.
+        case pauseStory(message: String)
+        /// The system resumed playback: resume a story this paused.
+        case resumeStory
+        /// Very high heat: show `message`, pause nothing.
+        case showWarning(message: String)
+        /// The heat came down: take the warning away.
+        case clearWarning
+    }
+
+    /// The calm message shown while the story is paused for comfort. One
+    /// sentence the viewer can read at a glance; it promises no timing,
+    /// because the system decides when playback comes back.
+    public static let comfortPauseMessage = "Paused for your comfort. The story will pick up where it left off."
+    /// The warning shown at very high heat. A suggestion, never an order:
+    /// the story keeps playing.
+    public static let heatWarningMessage = "This device is very warm. You may want to take a short break."
+
+    /// What a video comfort mitigation asks of the story. PURE.
+    ///
+    /// A pause or a reduced immersion pauses the story (OD-50: "pause the
+    /// whole story with it"); the system resuming playback resumes it. A
+    /// mitigation this build has no name for changes nothing: guessing a
+    /// pause would stop a story for a reason nobody can see.
+    public static func response(to mitigation: VideoMitigation) -> Response? {
+        switch mitigation {
+        case .pause, .reduceImmersion: return .pauseStory(message: comfortPauseMessage)
+        case .play:                    return .resumeStory
+        case .unknown:                 return nil
+        }
+    }
+
+    /// The warning the viewer sees at `level`, or nil. Only `.critical` is
+    /// "very high heat"; `.serious` is the system's own throttling and is
+    /// logged, not shown.
+    public static func thermalWarning(for level: ThermalLevel) -> String? {
+        level >= .critical ? heatWarningMessage : nil
+    }
+
+    /// Carries a response out. Set by `ChapterPlayerCore`; called on the main
+    /// actor, synchronously, as each signal is recorded.
+    @ObservationIgnored public var onResponse: ((Response) -> Void)?
+
+    /// The warning on show, if any (OD-50). For hosts and tests.
+    public private(set) var activeWarning: String?
+
     // MARK: - Published state
 
     /// The latest thermal reading.
@@ -134,6 +188,12 @@ public final class ComfortSignals {
         } else {
             logger.info("[comfort] thermal state \(previous.label, privacy: .public) -> \(level.label, privacy: .public)")
         }
+        // OD-50: very high heat shows a warning, and only a warning.
+        let warning = Self.thermalWarning(for: level)
+        if warning != activeWarning {
+            activeWarning = warning
+            onResponse?(warning.map { .showWarning(message: $0) } ?? .clearWarning)
+        }
         return true
     }
 
@@ -144,6 +204,7 @@ public final class ComfortSignals {
         lastMitigation = mitigation
         lastMitigationAt = date
         logger.warning("[comfort] video comfort mitigation #\(self.mitigationCount): \(mitigation.label, privacy: .public)")
+        if let response = Self.response(to: mitigation) { onResponse?(response) }
     }
 
     /// Forget the session's history. The current thermal level is a fact about
@@ -215,3 +276,64 @@ extension ComfortSignals.VideoMitigation {
         }
     }
 }
+
+// MARK: - The calm message (OD-50)
+
+#if canImport(UIKit)
+import UIKit
+
+/// Draws the one comfort message (a pause notice or a heat warning) in front
+/// of the viewer, on the caption recipe the Cue Prompt wears: white type on a
+/// dark rounded plate, billboarded, sized by visual angle. Announced once to
+/// VoiceOver when it appears. One message at a time; a new one replaces it.
+@MainActor
+public final class ComfortNoticePresenter {
+
+    /// The scene the message is drawn in (the head-rebased scene root).
+    public var sceneRootProvider: (() -> Entity?)?
+
+    /// The message on show, if any. Recorded even with no scene (a windowed
+    /// host, a test), so a host can still say it.
+    public private(set) var shown: String?
+    public private(set) var noticeEntity: Entity?
+
+    /// How far ahead of the viewer the message sits, and how far below the
+    /// line of sight: close enough to read, low enough not to cover the
+    /// picture it is talking about.
+    public static let viewerDistance: Float = 1.2
+
+    public init() {}
+
+    public func show(_ message: String?) {
+        hide()
+        guard let message, !message.isEmpty else { return }
+        shown = message
+        guard let root = sceneRootProvider?() else { return }
+        let capHeight = CuePromptPlan.capHeight(atDistance: Self.viewerDistance)
+        let container = Entity()
+        container.name = "comfort.notice"
+        container.components.set(BillboardComponent())
+        var accessibility = AccessibilityComponent()
+        accessibility.isAccessibilityElement = true
+        accessibility.label = LocalizedStringResource(stringLiteral: message)
+        container.components.set(accessibility)
+        if let built = try? CaptionBlock.build(text: message,
+                                               style: CuePromptPresenter.style(capHeight: capHeight)) {
+            container.addChild(CaptionBlock.makeBlock(built, name: "comfort.notice.text"))
+        }
+        container.position = SIMD3<Float>(0, -0.12 * Self.viewerDistance, -Self.viewerDistance)
+        root.addChild(container)
+        noticeEntity = container
+        if UIAccessibility.isVoiceOverRunning {
+            UIAccessibility.post(notification: .announcement, argument: message)
+        }
+    }
+
+    /// Take the message away. Idempotent.
+    public func hide() {
+        noticeEntity?.removeFromParent()
+        noticeEntity = nil
+        shown = nil
+    }
+}
+#endif

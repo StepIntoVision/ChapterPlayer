@@ -88,6 +88,21 @@ public final class InteractionController {
     /// is interactive with no error anywhere.
     @ObservationIgnored public var documentProvider: (() -> ChapterDocument?)?
 
+    /// THE SEQUENCE THAT IS PLAYING, read by `reinstall()` (format 8, OD-21).
+    ///
+    /// An Object's Interactions belong to each use of it in a Sequence, so a
+    /// visit arms the playing Sequence's Interactions and no other's. The
+    /// host wires this to the engine's current Sequence
+    /// (`sequenceEngine.currentSequence?.id`), which `play` sets before it
+    /// calls `reinstall()`. Left unwired it answers nil, and `install` falls
+    /// back to arming every Sequence's Interactions once each (the
+    /// pre-format-8 behavior), so a host that has not wired it yet still
+    /// answers every tap it answered before.
+    @ObservationIgnored public var playingSequenceProvider: (() -> String?)?
+
+    /// The Sequence the current visit armed (nil: every Sequence, see above).
+    public private(set) var armedSequenceId: String?
+
     /// Fired after any interaction runs — id and entity. Hosts use it for
     /// debug overlays and for the Mac preview's "this one fired" readout.
     @ObservationIgnored public var onInteractionFired: ((_ entityId: String, _ interactionId: String) -> Void)?
@@ -168,19 +183,32 @@ public final class InteractionController {
 
     // MARK: - Install / teardown
 
-    /// Arm every interaction on every entity the document defines.
+    /// Arm the PLAYING Sequence's Interactions (`playingSequenceProvider`).
     ///
-    /// Called at Sequence start. Deliberately document-wide rather than
-    /// Sequence-scoped: an interaction belongs to the OBJECT, and an object
-    /// that is not on screen is simply never hit — the watches all check
-    /// `entity.scene != nil` and `isEnabledInHierarchy` first, so an unrevealed
-    /// object cannot be looked at, walked up to or grabbed.
+    /// Called at Sequence start. Since format 8 an Interaction belongs to one
+    /// use of an Object in one Sequence (OD-21), so Act Three never answers a
+    /// tap Act One authored. An armed Object that is not on screen is still
+    /// never hit: the watches all check `entity.scene != nil` and
+    /// `isEnabledInHierarchy` first.
     public func install(document: ChapterDocument) {
+        install(document: document, sequenceId: playingSequenceProvider?())
+    }
+
+    /// Arm `sequenceId`'s Interactions; nil arms every Sequence's once each
+    /// (`armedInteractions(in:sequenceId:)`).
+    public func install(document: ChapterDocument, sequenceId: String?) {
         teardown()
-        for entity in document.entities where entity.isInteractive {
-            ledger.register(entity.resolvedInteractions)
-            for spec in entity.resolvedInteractions {
-                decorate(entity, target: spec.target)
+        armedSequenceId = sequenceId
+        var definitions: [String: EntityDefinition] = [:]
+        for entity in document.entities where definitions[entity.id] == nil {
+            definitions[entity.id] = entity
+        }
+        for use in Self.armedInteractions(in: document, sequenceId: sequenceId) {
+            // An Object with no definition has nothing to decorate or resolve.
+            guard let entity = definitions[use.objectId] else { continue }
+            ledger.register(use.interactions)
+            for spec in use.interactions {
+                decorate(entity, interactions: use.interactions, target: spec.target)
                 register(spec, on: entity.id)
             }
         }
@@ -189,13 +217,44 @@ public final class InteractionController {
         if let scene = decorated.keys.compactMap({ entityProvider?($0)?.scene }).first {
             subscribeAccessibility(in: scene)
         }
-        logger.info("Armed \(self.armedCount) interaction(s) across \(self.decorated.count) object(s)")
+        logger.info("Armed \(self.armedCount) interaction(s) across \(self.decorated.count) object(s) for Sequence '\(sequenceId ?? "every Sequence")'")
     }
 
-    /// Re-arm from `documentProvider`. No-op when no document is loaded.
+    /// WHAT ONE VISIT ARMS. Pure, so it is the same answer on every host.
+    ///
+    /// With a Sequence: that Sequence's Interactions in the Chapter's Object
+    /// order (`ChapterDocument.interactions(inSequence:)`, which also places a
+    /// pre-format-8 list the document has not lifted yet).
+    ///
+    /// Without one (a host that has not wired `playingSequenceProvider`):
+    /// every Sequence's Interactions, an id armed once (its first use wins,
+    /// since the ledger is keyed by id), then any pre-format-8 list still on
+    /// an Object. That is what was armed before format 8.
+    public static func armedInteractions(in document: ChapterDocument,
+                                         sequenceId: String?) -> [ObjectInteractions] {
+        if let sequenceId { return document.interactions(inSequence: sequenceId) }
+        var seen: Set<String> = []
+        var merged: [ObjectInteractions] = []
+        var indexByObject: [String: Int] = [:]
+        for use in document.allObjectInteractions {
+            let fresh = use.interactions.filter { seen.insert($0.id).inserted }
+            guard !fresh.isEmpty else { continue }
+            if let index = indexByObject[use.objectId] {
+                merged[index].interactions += fresh
+            } else {
+                indexByObject[use.objectId] = merged.count
+                merged.append(ObjectInteractions(sequenceId: nil, objectId: use.objectId,
+                                                 interactions: fresh))
+            }
+        }
+        return merged
+    }
+
+    /// Re-arm from `documentProvider`, for the playing Sequence. No-op when no
+    /// document is loaded.
     public func reinstall() {
         guard let document = documentProvider?() else { return }
-        install(document: document)
+        install(document: document, sequenceId: playingSequenceProvider?())
     }
 
     /// **THIS VISIT'S ONE-SHOT AND ENABLEMENT STATE, TO PUT ASIDE.**
@@ -353,7 +412,11 @@ public final class InteractionController {
     public func beginSpan(_ interactionId: String) -> Bool {
         guard let registration = registrations[interactionId] else { return false }
         guard isPresent(registration) else { return false }
-        let (outcome, responses) = ledger.beginSpan(interactionId)
+        // RECORD BEFORE ANYTHING RUNS (TODO-104): whether each Object the
+        // responses show or hide is visible now, so the span's end puts it
+        // back rather than applying the opposite.
+        let recorded = visibilityNow(of: ledger.spec(interactionId)?.actions ?? [])
+        let (outcome, responses) = ledger.beginSpan(interactionId, visibility: { recorded[$0] })
         guard outcome.didFire else {
             logger.debug("Interaction '\(interactionId)' span begin refused: \(String(describing: outcome))")
             return false
@@ -373,6 +436,38 @@ public final class InteractionController {
             ledger.closeSpanWithoutRelease(interactionId)
         }
         return true
+    }
+
+    /// Whether each Object `actions` show, hide or reveal is visible right now
+    /// (`isEnabled`, what show and hide write). An Object not in the registry
+    /// has no entry, and its end falls back to the opposite.
+    private func visibilityNow(of actions: [SegmentActionDTO]) -> [String: Bool] {
+        var visible: [String: Bool] = [:]
+        for name in InteractionSpanRelease.visibilityTargets(of: actions) {
+            if let entity = entityProvider?(name) { visible[name] = entity.isEnabled }
+        }
+        return visible
+    }
+
+    /// THE ACCESSIBLE ROUTE TO ONE INTERACTION (TODO-104).
+    ///
+    /// For a span timing on a lasting trigger the accessible action is a
+    /// toggle, the rule `InteractionLedger.toggleSpan` states: `.whileActive`
+    /// and `.onExit` begin the span on one activation and end it on the next;
+    /// everything else, `.onEnter` included, is an ordinary activation. It goes
+    /// through `beginSpan` / `endSpan`, so presence, the recorded visibility
+    /// and a response that ends its own span behave exactly as on the
+    /// physical route. Returns whether a response ran.
+    @discardableResult
+    public func activateAccessibly(_ interactionId: String) -> Bool {
+        guard let spec = ledger.spec(interactionId) else { return false }
+        guard spec.trigger.hasSpan else { return activate(interactionId) }
+        switch spec.lifetime {
+        case .whileActive, .onExit:
+            return ledger.isSpanOpen(interactionId) ? endSpan(interactionId) : beginSpan(interactionId)
+        case .once, .everyTime, .onEnter:
+            return activate(interactionId)
+        }
     }
 
     /// Interactions whose span-begin responses are running right now. Read
@@ -641,15 +736,25 @@ public final class InteractionController {
     /// Interactions whose accessible action cannot be described from authored
     /// data — an author-facing problem, surfaced rather than papered over with
     /// an implementation string.
+    ///
+    /// Every use in every Sequence is checked; an Interaction copied into
+    /// several Sequences with the same content is reported once.
     public func accessibilityWarnings(in document: ChapterDocument) -> [String] {
-        document.entities.flatMap { entity in
-            entity.resolvedInteractions.compactMap { interaction -> String? in
+        var names: [String: String] = [:]
+        for entity in document.entities where names[entity.id] == nil {
+            names[entity.id] = entity.resolvedDisplayName
+        }
+        var reported: Set<String> = []
+        return document.allObjectInteractions.flatMap { use in
+            use.interactions.compactMap { interaction -> String? in
                 guard interaction.initiallyEnabled,
                       interaction.trigger.requiresSpatialInput,
                       interaction.actions.isEmpty,
-                      (interaction.accessibilityHint ?? interaction.name) == nil
+                      (interaction.accessibilityHint ?? interaction.name) == nil,
+                      reported.insert(use.objectId + "\u{1f}" + interaction.id).inserted
                 else { return nil }
-                return "‘\(entity.resolvedDisplayName)’ has a \(InteractionSemantics.triggerPhrase(interaction.trigger)) interaction with no response and no spoken description, so assistive technology has nothing meaningful to offer."
+                let name = names[use.objectId] ?? use.objectId
+                return "‘\(name)’ has a \(InteractionSemantics.triggerPhrase(interaction.trigger)) interaction with no response and no spoken description, so assistive technology has nothing meaningful to offer."
             }
         }
     }
@@ -731,7 +836,7 @@ public final class InteractionController {
         if let candidate = candidates.min(by: { $0.depth < $1.depth }),
            let spec = ledger.spec(candidate.id) {
             logger.info("Accessibility action ‘\(name)’ → interaction '\(candidate.id)'")
-            let ran = activate(candidate.id)
+            let ran = activateAccessibly(candidate.id)
             _ = offerToGate?(candidate.owner, spec.trigger, ran, true)
             return
         }
@@ -820,6 +925,7 @@ public final class InteractionController {
     /// — INCLUDING `.none`, which suppresses a visual affordance and must never
     /// suppress the semantic one.
     private func decorate(_ definition: EntityDefinition,
+                          interactions: [InteractionSpec],
                           target: SubElementTarget?) {
         let key = target.map { $0.objectId + "\u{1f}" + $0.primPath }
             ?? definition.id
@@ -831,9 +937,7 @@ public final class InteractionController {
             // installed on the next `install` after materialization.
             return
         }
-        let targetInteractions = definition.resolvedInteractions.filter {
-            $0.target == target
-        }
+        let targetInteractions = interactions.filter { $0.target == target }
         var record = DecorationRecord(ownerId: definition.id, target: target,
                                       addedInputTarget: false, addedCollision: false,
                                       addedHoverEffect: false, addedAccessibility: false,

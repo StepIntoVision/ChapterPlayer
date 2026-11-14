@@ -103,6 +103,28 @@ public final class StoryRegionController {
     /// `exitWatchDidBegin`.
     @ObservationIgnored public var exitWatchDidEnd: (() -> Void)?
 
+    /// THE RESPONSE (OD-96). A looping Area played its loop count, or a
+    /// play-once Area's "if nothing for X seconds" ran out, with nobody
+    /// acting. The host runs `region.responseActions` through the ordinary
+    /// action path, once. An empty list is Continue: the story is let go
+    /// here as it always was. A Response that navigates is left to its Go To.
+    @ObservationIgnored public var runResponse: ((StoryRegion) -> Void)?
+
+    /// A LOOPING Area's loop clock moved (OD-25): seconds parked at its end
+    /// so far, and the previous value (`nil` the moment the hold began). The
+    /// host restarts the media that loops with the Area
+    /// (`StoryRegionLoopMedia.commands`). Called every tick while a looping
+    /// Area waits unresolved; never during the first pass.
+    @ObservationIgnored public var areaLoopDidAdvance:
+        ((_ region: StoryRegion, _ previousDwell: TimeInterval?, _ dwell: TimeInterval) -> Void)?
+
+    /// A LOOPING Area's exit released the hold, the loop at `dwell`. The
+    /// host puts the looped media back in sync with the authored boundary
+    /// (`StoryRegionLoopMedia.exitCommands`) before the story resumes. Not
+    /// called for an interruption (a seek or a jump moves the media itself).
+    @ObservationIgnored public var areaLoopWillRelease:
+        ((_ region: StoryRegion, _ dwell: TimeInterval) -> Void)?
+
     /// When a continuation is applied, and why.
     public enum ContinuationPhase: Sendable, Equatable {
         /// The authored first pass reached the boundary and the story is now
@@ -135,6 +157,12 @@ public final class StoryRegionController {
     @ObservationIgnored private var didRelease = false
     /// The early exit watch for the active Area is running.
     @ObservationIgnored private var exitWatchActive = false
+    /// The loop clock reported last tick, while a looping Area waits.
+    @ObservationIgnored private var lastLoopDwell: TimeInterval?
+
+    /// Full loops a looping Area has played at its end, for a host readout.
+    /// Published on change only.
+    public private(set) var completedLoops: Int = 0
 
     public init() {}
 
@@ -159,6 +187,8 @@ public final class StoryRegionController {
         didRelease = false
         isHolding = false
         displayDwell = 0
+        lastLoopDwell = nil
+        completedLoops = 0
     }
 
     // MARK: - The tick
@@ -183,10 +213,15 @@ public final class StoryRegionController {
 
         guard var runtime = active else { return }
 
-        // THE FALLBACK TIMER, polled rather than scheduled — measured from
-        // region ENTRY, on the pause-aware clock.
-        if runtime.applyFallbackIfDue(atRuntimeTime: now) {
-            logger.info("Explore region '\(runtime.region.id)' resolved by its fallback timer")
+        // THE RESPONSE (OD-96), polled rather than scheduled, on the
+        // pause-aware clock: a play-once Area's timer from region ENTRY, a
+        // looping Area's loop count at its end. Runs once, as it resolves.
+        if let reason = runtime.applyResponseIfDue(authoredTime: authored, atRuntimeTime: now) {
+            logger.info("Explore region '\(runtime.region.id)' resolved by \(reason.rawValue); running its Response (\(runtime.region.responseActions.count) action(s))")
+            // Stored first, so a Response that reads the controller sees the
+            // Area already resolved.
+            active = runtime
+            runResponse?(runtime.region)
         }
 
         let phase = runtime.phase(authoredTime: authored)
@@ -211,13 +246,29 @@ public final class StoryRegionController {
             }
         }
 
-        // RELEASING. The exit resolved (by condition or timer) while held, so
-        // the story may go. One call, the same one a tap makes.
+        // THE AREA'S OWN LOOP (OD-25): media inside a looping Area's range
+        // repeats with it while it waits unresolved.
+        if isHolding, phase == .held, runtime.region.playbackMode == .loop {
+            let dwell = runtime.dwell(authoredTime: authored, atRuntimeTime: now)
+            areaLoopDidAdvance?(runtime.region, lastLoopDwell, dwell)
+            lastLoopDwell = dwell
+            let loops = runtime.completedLoops(authoredTime: authored, atRuntimeTime: now)
+            if loops != completedLoops { completedLoops = loops }
+        }
+
+        // RELEASING. The exit resolved (by condition or Response) while
+        // held, so the story may go. One call, the same one a tap makes —
+        // except after a Response that navigates: its Go To decides where
+        // the story goes, and letting the boundary go as well would start
+        // the next Segment under it.
         if phase == .resolved || runtime.resolution != nil {
+            let goToDecides = runtime.resolvedByResponse && runtime.region.responseNavigates
             if isHolding {
                 leaveHold(runtime.region)
                 logger.info("Explore region '\(runtime.region.id)' released — resuming Directed playback")
-                releaseOnce()
+                if !goToDecides { releaseOnce() }
+            } else if goToDecides {
+                // Nothing to let go: the Response's Go To leaves the Area.
             } else if Self.isEnd(of: runtime.region, at: authored) {
                 // RESOLVED BEFORE THE HOLD BEGAN, and the story is now AT the
                 // boundary. A fallback no longer than the preview (the
@@ -275,11 +326,17 @@ public final class StoryRegionController {
     /// at its end. Nothing in the first pass is skipped.
     ///
     /// Returns true when this act finished the Area.
+    ///
+    /// ONE ACT, ONE ANSWER (OD-121): `answeredACue` is true when the same act
+    /// has just released a waiting Cue; then it finishes nothing else. The
+    /// Area's exit timing decides whether a first-pass act counts at all.
     @discardableResult
     public func offerEarlyExit(_ activation: SemanticActivation,
-                               state: some StoryStateReading) -> Bool {
+                               state: some StoryStateReading,
+                               answeredACue: Bool = false) -> Bool {
         guard let runtime = active, let authored = authoredClock?(),
-              runtime.acceptsEarlyExit(activation, authoredTime: authored, state: state)
+              runtime.acceptsEarlyExit(activation, authoredTime: authored, state: state,
+                                       answeredACue: answeredACue)
         else { return false }
         resolveActiveRegion()
         logger.info("Explore exit satisfied early, during the first pass of '\(runtime.region.id)'")
@@ -293,6 +350,7 @@ public final class StoryRegionController {
         active = runtime
         endExitWatch()
         clearLoopOverrides()
+        lastLoopDwell = nil
         endHoldIfNeeded()
     }
 
@@ -308,6 +366,8 @@ public final class StoryRegionController {
         active = nil
         didRelease = false
         displayDwell = 0
+        lastLoopDwell = nil
+        completedLoops = 0
     }
 
     /// THE EXIT RELEASED THE HOLD: the viewer acted, a Memory exit came true,
@@ -397,7 +457,10 @@ public final class StoryRegionController {
             }
 
             // FOR AN ANIMATION, `.hold` means "do nothing": its only clock is
-            // the authored one, and that is already parked.
+            // the authored one, and that is already parked. Hold Pose is also
+            // what an animation nobody configured does, in a looping Area too
+            // (OD-117, `StoryRegion.defaultAnimationBehavior`): only an
+            // explicit Loop Animation installs the overlay below.
             //
             // FOR MEDIA IT DOES NOT. A video or a sound runs on its own
             // player, which a parked Sequence clock does not stop — so an
@@ -423,6 +486,12 @@ public final class StoryRegionController {
     /// hold ends. Said once for the timer's release in `tick` and for every
     /// other exit in `exitDidRelease`.
     private func leaveHold(_ region: StoryRegion) {
+        // A looping Area's media goes back in sync with the boundary first,
+        // so the exit fades below fade what the story resumes with.
+        if region.playbackMode == .loop, let dwell = lastLoopDwell {
+            areaLoopWillRelease?(region, dwell)
+        }
+        lastLoopDwell = nil
         applyContinuations(for: region, phase: .leavingHold)
         clearLoopOverrides()
         endHoldIfNeeded()
@@ -438,8 +507,12 @@ public final class StoryRegionController {
     }
 
     /// Start the early exit watch for `region`, once per Area execution.
+    ///
+    /// Only when a first-pass act could count (OD-121): never under "Only
+    /// while waiting", and not for a plain tap exit under the default.
     private func beginExitWatchIfNeeded(_ region: StoryRegion) {
-        guard !exitWatchActive, active?.resolution == nil else { return }
+        guard !exitWatchActive, let runtime = active, runtime.resolution == nil,
+              runtime.watchesExitDuringFirstPass else { return }
         exitWatchActive = true
         exitWatchDidBegin?(region)
     }

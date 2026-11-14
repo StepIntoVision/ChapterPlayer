@@ -20,6 +20,7 @@
 import Foundation
 import Network
 import OSLog
+import ChapterScript
 
 private let logger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "com.shellcorp.sharedvisions",
@@ -178,6 +179,9 @@ enum LiveTransportResolver {
         request.httpMethod = "HEAD"
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        // The format this player reads rides every `/chapter.json` request
+        // (OD-112), the verification probe included.
+        request.setValue(String(LiveLinkFormat.current), forHTTPHeaderField: LiveLinkFormat.headerName)
         guard let (_, response) = try? await URLSession.shared.data(for: request),
               let http = response as? HTTPURLResponse else { return false }
         return (200...299).contains(http.statusCode)

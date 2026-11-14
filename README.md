@@ -4,7 +4,7 @@ The open source visionOS runtime that plays [ChapterScript](https://github.com/S
 
 ChapterPlayer is the same runtime that powers headset playback in [Maestro](https://maestrostud.io), the commercial authoring suite: MaestroVision embeds it unchanged. Maestro's Mac editor previews with its own evaluator, not with ChapterPlayer. Website: [chapterscript.com](https://chapterscript.com).
 
-It reads ChapterScript **format 7**. Documents saved in formats 2–6 are migrated on load (`Migrator.migrate`); a document newer than the linked ChapterScript fails to load with `sourceVersionTooNew`.
+It reads ChapterScript **format 8**. Documents saved in formats 2–7 are migrated on load (`Migrator.migrate`; format 8 moves each Object's Interactions into the Sequences that use it); a document newer than the linked ChapterScript fails to load with `sourceVersionTooNew`. Over a Maestro live link the format is stated, not gated: a newer Mac document is decoded as it stands and the host is told the two versions differ.
 
 ## What's in the package
 
@@ -20,10 +20,11 @@ It reads ChapterScript **format 7**. Documents saved in formats 2–6 are migrat
 
 ## Not played yet
 
-Format fields the runtime does not read today (checked 2026-11-13):
+Format fields the runtime reads only partly today (checked 2026-11-14):
 
-- `VideoActionDTO.convergence` and `VideoActionDTO.virtualCamera`. The bridge `VideoAction.init(_ dto: VideoActionDTO)` (`ChapterEngine/ChapterScript+Runtime.swift`) does not copy them, so the headset shows the whole source with the source's own stereo, ignoring the authored convergence and framing.
-- `SequenceStereoAutomation`: keyed convergence on a Sequence (`SequenceDefinitionDTO.stereoTracks`).
+- `VideoActionDTO.convergence` and `SequenceStereoAutomation` (`SequenceDefinitionDTO.stereoTracks`): the bridge `VideoAction.init(_ dto: VideoActionDTO)` (`ChapterEngine/ChapterScript+Runtime.swift`) does not copy them; `VideoPlaybackManager` reads them from the document through `authoredStereoProvider` and works out the effective convergence, but does not draw it, because a `VideoMaterial` panel shows one texture to both eyes. A frame-packed panel is not split by eye.
+- `VideoActionDTO.virtualCamera` (Flat View) is drawn on Screens by remapping the panel's texture coordinates (`HeadsetStereoPresentation`), with known differences from the Mac's kernel: an edge stretch outside a half-sphere's coverage, square corners, and grading before the flatten.
+- A Cue's `choice` is read from the document (`authoredGate(for:)`), not carried on the runtime `SegmentGate`.
 
 ## Consumer responsibilities
 

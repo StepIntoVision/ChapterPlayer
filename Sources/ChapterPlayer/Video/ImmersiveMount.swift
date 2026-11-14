@@ -60,6 +60,19 @@ public enum ImmersiveMount {
         }
     }
 
+    // MARK: - Which Immersive Track (OD-9)
+    //
+    // SEVERAL IMMERSIVE TRACKS, EACH THROUGH ITS OWN MOUNT. A Chapter may
+    // route immersive clips to more than one Immersive Track
+    // (`VideoActionDTO.immersiveTrack`; absent = the one built-in track,
+    // which is every older Chapter). The editor names each track's channel
+    // from the track (`DestinationChannelNaming`, via
+    // `ImmersiveTrackRouting.routed`), and `VideoPlaybackManager` gives
+    // every immersive CHANNEL its own shell (`immersiveShellKey(for:)`), so
+    // two tracks playing at once are two mounts, each decided here by
+    // `decision(layout:declared:)`. Nothing in the runtime reads the track
+    // id itself: the channel already carries the route.
+
     /// Why a stereo master that carries no projection tag may not look like
     /// the authored environment, for the log and the Inspector.
     public static func advisory(layout: VideoLayout, declared: DeclaredProjection) -> String? {

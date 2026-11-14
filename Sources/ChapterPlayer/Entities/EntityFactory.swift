@@ -18,6 +18,8 @@
 //  `.particles` entities resolve their `particlePresetId` against the
 //  document's `particlePresets` and render a real `ParticleEmitterComponent`
 //  (see ParticleEmitterEntity.swift for the format → RealityKit mapping).
+//  Any other kind that carries a `particlePresetId` (a preset attached to an
+//  Object, OD-80) gets the same emitter on its own entity (`attachParticles`).
 //
 
 import Foundation
@@ -122,6 +124,12 @@ public final class EntityFactory {
                 return nil
             }
         }
+
+        // A PRESET ATTACHED TO ANY OBJECT (OD-80) rides on the entity just
+        // built, whatever kind it is; an emitter Object installed its own in
+        // `makeParticleEmitter`. One pass after the switch, so no kind can be
+        // left out of it.
+        attachParticles(definition, to: entity)
 
         entity.name = definition.id
         applyTransform(definition.transform, to: entity)

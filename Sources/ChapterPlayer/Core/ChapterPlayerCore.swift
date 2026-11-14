@@ -32,6 +32,15 @@ private let logger = Logger(
 
 @MainActor private var _lastVideoBackdropSignatureStore: String?
 
+/// WHICH ENGINE NAVIGATION THIS CODE IS RUNNING FOR (OD-111). Set for the
+/// whole of an engine-raised navigation's Task (an authored Go To, a Sequence
+/// ending, a story decision re-check, a Choice's Path), and nil for a host's
+/// own call. That is how `navigate`, `performCompletion` and the performer
+/// tell the engine's request from the person's without a second entry point.
+private enum EngineNavigationContext {
+    @TaskLocal static var token: Int?
+}
+
 @MainActor
 @Observable
 open class ChapterPlayerCore {
@@ -77,9 +86,24 @@ open class ChapterPlayerCore {
     public private(set) var heldStoryDecision: StoryDecisionHold?
 
     /// Comfort and heat, as the system reports them: thermal state and video
-    /// comfort mitigations. SURFACED ONLY — nothing in the player reacts to
-    /// them. See `ComfortSignals`.
+    /// comfort mitigations. OD-50: a comfort pause or reduced immersion
+    /// pauses the whole story with a short calm message, and the system's
+    /// resume resumes it; very high heat shows a warning only. See
+    /// `ComfortSignals` and `handleComfortResponse(_:)`.
     public let comfortSignals = ComfortSignals()
+
+    /// The comfort message on show (OD-50). See `ComfortNoticePresenter`.
+    public let comfortNotice = ComfortNoticePresenter()
+
+    /// True while the story is paused because the system paused or shrank
+    /// video for comfort (OD-50), and only then: a pause the person made is
+    /// never resumed by the system's signal.
+    public private(set) var isStoryPausedForComfort = false
+
+    /// THE VIEWER-FACING CHOICE (OD-8): the question and its options, drawn
+    /// while the story waits at a Cue that carries a Choice. See
+    /// `ChoicePresenter` and `pickChoiceOption(_:)`.
+    public let choices = ChoicePresenter()
 
     /// THE ONE AUTHORITY FOR MOVEMENT BETWEEN SEQUENCES.
     ///
@@ -152,6 +176,40 @@ open class ChapterPlayerCore {
     /// (OD-23: one act, one Cue), whichever of the two watches fired first.
     private var waitingCueGate: SegmentGateDTO?
     private var lastCueAnswered: (gate: SegmentGateDTO, at: Date)?
+
+    /// THE CHOICE CUE THE STORY IS WAITING AT (OD-8), from its activation
+    /// until it resolves. `picked` tells a timeout from a pick, so a timeout
+    /// option is taken only when nobody picked.
+    private struct ChoiceWait {
+        let gate: SegmentGateDTO
+        let visit: SequenceVisitID?
+        let sequenceId: String?
+        let segmentIndex: Int
+        /// The engine's pause-aware clock when the wait began.
+        let began: TimeInterval
+        var picked = false
+    }
+    @ObservationIgnored private var choiceWait: ChoiceWait?
+
+    /// THE ENGINE NAVIGATION IN FLIGHT (OD-111), if any: the one that holds
+    /// the slot. A host Play cancels it (`cancelEngineNavigationForHost`),
+    /// which puts the navigator back as it was before the engine's request,
+    /// frees the slot and makes the engine's performer stop at its next
+    /// check. `committed` is set once the engine has started the new
+    /// Sequence: from there it is done, and nothing is left to cancel.
+    private struct EngineNavigation {
+        let token: Int
+        let what: String
+        let navigatorBefore: ExperienceNavigator
+        var holdsSlot = true
+        var canceled = false
+        var committed = false
+    }
+    @ObservationIgnored private var engineNavigation: EngineNavigation?
+    @ObservationIgnored private var engineNavigationCounter = 0
+    /// How many engine navigations a host Play has canceled (OD-111). A
+    /// diagnostic for hosts and tests.
+    public private(set) var canceledEngineNavigationCount = 0
 
     private func pruneVisitLedgers() {
         guard visitLedgers.count > 64 else { return }
@@ -614,6 +672,28 @@ open class ChapterPlayerCore {
         interactions.documentProvider = { [weak self] in
             self?.currentDocumentForStyling()
         }
+        // OD-21: arm only the PLAYING Sequence's Interactions. The engine sets
+        // `currentSequence` before it re-installs them, so this reads the new
+        // Sequence; with no Sequence playing the controller arms the union.
+        interactions.playingSequenceProvider = { [weak self] in
+            self?.sequenceEngine.currentSequence?.id
+        }
+        // OD-87: the AUTHORED Sequence, so a Cue wait reads each clip's
+        // "While waiting at a Cue" setting (Keep Playing, Hold, Stop).
+        sequenceEngine.sequenceDTOProvider = { [weak self] id in
+            self?.currentDocumentForStyling()?.sequences.first { $0.id == id }
+        }
+        // OD-24: Flat View (and the Convergence value) read from the playing
+        // Sequence's authored keys and the document's video decisions.
+        videoManager.authoredStereoProvider = { [weak self] in
+            guard let self,
+                  let document = self.currentDocumentForStyling(),
+                  let id = self.sequenceEngine.currentSequence?.id,
+                  let sequence = document.sequences.first(where: { $0.id == id })
+            else { return nil }
+            return HeadsetStereoPresentation.Authored(
+                sequence: sequence, videoInterpretations: document.editorMetadata?.videoInterpretations ?? [:])
+        }
 
         // THE GATE, AS THE SECOND CONSUMER OF ONE SEMANTIC ACTIVATION.
         interactions.offerToGate = { [weak self] entityName, trigger, interactionRan, isAccessible in
@@ -626,7 +706,15 @@ open class ChapterPlayerCore {
         // withdraws it when it resolves. Event-driven, never polled.
         gateDetection.onGateActivated = { [weak self] gate in
             guard let self else { return }
-            self.waitingCueGate = gate.authored
+            let authored = self.authoredGate(for: gate)
+            self.waitingCueGate = authored
+            // A CUE THAT CARRIES A CHOICE (OD-8) shows its question and its
+            // options instead of a Prompt and a waiting sign, and offers no
+            // "Continue": it is answered by a pick (or its timeout).
+            if GateActivation.waitsForChoice(authored) {
+                self.beginChoiceWait(authored)
+                return
+            }
             // THE VIEWER SEES WHAT THE STORY IS WAITING FOR (OD-38): the
             // Cue's Prompt and a small waiting sign, near its Object.
             self.cuePrompts.show(CuePromptPlan.plan(for: gate))
@@ -649,6 +737,20 @@ open class ChapterPlayerCore {
             self.waitingCueGate = nil
             self.interactions.clearGateActions()
             self.cuePrompts.hide()
+            // Answered, timed out, stopped or seeked past: the options go.
+            self.endChoiceWait()
+        }
+        choices.sceneRootProvider = { [weak self] in
+            self?.immersiveSceneRoot
+        }
+        choices.entityProvider = { [weak self] name in
+            self?.entityExecutor.entityRegistry[name]
+        }
+        choices.onPick = { [weak self] optionId in
+            _ = self?.pickChoiceOption(optionId)
+        }
+        comfortNotice.sceneRootProvider = { [weak self] in
+            self?.immersiveSceneRoot
         }
 
         // STORY STATE. The engine applies mutations into this session's store;
@@ -691,6 +793,17 @@ open class ChapterPlayerCore {
         storyRegions.applyExitFade = { [weak self] target, seconds in
             self?.applyStoryExitFade(target: target, seconds: seconds)
         }
+        // OD-50: wired BEFORE observation starts, so a device that is
+        // already very warm shows its warning from the first reading.
+        comfortSignals.onResponse = { [weak self] response in
+            self?.handleComfortResponse(response)
+        }
+        // A comfort pause the PERSON ended (Play, a Cue's act, a Stop) takes
+        // its message with it. The engine reports every transport change
+        // here; this is the only reader, and the check is one comparison.
+        sequenceEngine.onStatusUpdate = { [weak self] _ in
+            self?.comfortPauseEndedElsewhereIfResumed()
+        }
         comfortSignals.startObservingThermalState()
         videoManager.onVideoComponentAttached = { [weak self] entity in
             self?.comfortSignals.observeVideoComfort(in: entity.scene)
@@ -706,6 +819,20 @@ open class ChapterPlayerCore {
         // and its accessible equivalent is offered, so an early act counts.
         storyRegions.exitWatchDidBegin = { [weak self] region in
             self?.armAreaExit(region.exit)
+        }
+        // THE RESPONSE (OD-96): run through the one action path an
+        // Interaction's response takes, so a Go To, a sound or a Memory
+        // change means one thing in this app.
+        storyRegions.runResponse = { [weak self] region in
+            self?.runAreaResponse(region)
+        }
+        // A LOOPING AREA'S MEDIA (OD-25, OD-99): everything inside its range
+        // repeats with it while it waits, sound included.
+        storyRegions.areaLoopDidAdvance = { [weak self] region, previous, dwell in
+            self?.advanceAreaLoop(region, from: previous, to: dwell)
+        }
+        storyRegions.areaLoopWillRelease = { [weak self] region, dwell in
+            self?.releaseAreaLoop(region, dwell: dwell)
         }
         storyRegions.exitWatchDidEnd = { [weak self] in
             self?.gateDetection.disarmAreaExit()
@@ -739,9 +866,8 @@ open class ChapterPlayerCore {
         // the same `.navigate` action, the same intent and the same transition.
         // There is no accessibility-specific Sequence change (Phase 6's rule).
         sequenceEngine.onNavigationRequested = { [weak self] intent in
-            guard let self, self.reserveEngineNavigation("a Go To") else { return }
-            Task { @MainActor in
-                defer { self.navigationsInFlight -= 1 }
+            guard let self else { return }
+            self.startEngineNavigation("a Go To") {
                 // EXPLICIT NAVIGATION LEAVES AN EXPLORE REGION IMMEDIATELY.
                 // Satisfying a Region's exit is a different act and does not
                 // come through here — see `docs/EXPERIENCE_FLOW.md` §6.
@@ -759,19 +885,109 @@ open class ChapterPlayerCore {
         // `autoAdvance` therefore behaves identically while sharing one
         // execution path with every new navigation kind.
         sequenceEngine.onSequenceComplete = { [weak self] completion in
-            guard let self, let finished = self.activeSequenceId,
-                  self.reserveEngineNavigation("a Sequence ending") else { return }
+            guard let self, let finished = self.activeSequenceId else { return }
             // A FINISHED SEQUENCE IS AT ITS END. Captured now (the engine
             // also holds its clock there once it stops, OD-45), so a
             // Return · Resume into it lands on its last Segment as the Mac
             // does, rather than replaying it from Segment 1.
             let endPosition = self.sequenceEngine.totalDuration
-            Task { @MainActor in
-                defer { self.navigationsInFlight -= 1 }
-                await self.performCompletion(completion.authored, from: finished,
-                                             endingAt: endPosition)
+            let authored = completion.authored
+            self.startEngineNavigation("a Sequence ending") {
+                await self.performCompletion(authored, from: finished, endingAt: endPosition)
             }
         }
+    }
+
+    // MARK: - Engine navigation: one at a time, and a host Play wins (OD-46, OD-111)
+
+    /// RESERVE THE SLOT AND CARRY OUT AN ENGINE-RAISED NAVIGATION, or drop it
+    /// when another navigation holds the slot (OD-46). Returns false when
+    /// dropped. `body` runs in its own Task with `EngineNavigationContext`
+    /// set, so everything it calls knows it is the engine's request, which a
+    /// host Play may cancel (OD-111).
+    @discardableResult
+    private func startEngineNavigation(_ what: String,
+                                       _ body: @escaping @MainActor () async -> Void) -> Bool {
+        guard reserveEngineNavigation(what) else { return false }
+        engineNavigationCounter += 1
+        let token = engineNavigationCounter
+        engineNavigation = EngineNavigation(token: token, what: what, navigatorBefore: navigator)
+        Task { @MainActor in
+            defer { self.finishEngineNavigation(token) }
+            // Canceled before it began: nothing was decided, nothing to undo.
+            guard self.engineNavigationIsCurrent(token) else { return }
+            await EngineNavigationContext.$token.withValue(token) {
+                await body()
+            }
+        }
+        return true
+    }
+
+    /// Is the engine navigation `token` still wanted? False once a host Play
+    /// canceled it, or once another took its place.
+    private func engineNavigationIsCurrent(_ token: Int) -> Bool {
+        guard let navigation = engineNavigation, navigation.token == token else { return false }
+        return !navigation.canceled
+    }
+
+    /// The engine navigation's Task finished: release its slot, unless a
+    /// host Play already did when it canceled it.
+    private func finishEngineNavigation(_ token: Int) {
+        guard let navigation = engineNavigation, navigation.token == token else { return }
+        engineNavigation = nil
+        if navigation.holdsSlot { navigationsInFlight -= 1 }
+    }
+
+    /// May the code running now carry on? Always for a host's own call; for
+    /// an engine navigation, only while no host Play has canceled it.
+    private var mayProceed: Bool {
+        guard let token = EngineNavigationContext.token else { return true }
+        return engineNavigationIsCurrent(token)
+    }
+
+    /// Count a navigation that is running now, for the one-at-a-time rule.
+    /// An engine navigation's slot already counts everything it calls, so
+    /// only a host's call counts itself; that is what lets a host Play free
+    /// the slot of the engine navigation it cancels at once.
+    private func countNavigation() -> Bool {
+        guard EngineNavigationContext.token == nil else { return false }
+        navigationsInFlight += 1
+        return true
+    }
+
+    /// A HOST PLAY CANCELS AN IN-FLIGHT ENGINE NAVIGATION AND WINS (OD-111,
+    /// owner decision). Called at the start of every host entry (`playSequence`,
+    /// `navigate`, `performCompletion` called by a host, and `stopSequence`,
+    /// a Stop being the person's request too). The engine's request
+    /// is undone where it stands: the navigator goes back to what it was
+    /// before that request, its slot is freed (so the new Sequence's own t=0
+    /// Go To is still accepted), and its performer stops at its next check
+    /// without starting anything. A navigation that already started its
+    /// Sequence is finished, not canceled.
+    private func cancelEngineNavigationForHost() {
+        guard EngineNavigationContext.token == nil,
+              var navigation = engineNavigation,
+              !navigation.canceled, !navigation.committed else { return }
+        navigation.canceled = true
+        navigator = navigation.navigatorBefore
+        // The person's request moves the story on, so no held ending is still
+        // deciding, and freeing the slot below must not start its re-check.
+        heldStoryDecision = nil
+        recheckPendingForHeldDecision = false
+        if navigation.holdsSlot {
+            navigation.holdsSlot = false
+            navigationsInFlight -= 1
+        }
+        engineNavigation = navigation
+        canceledEngineNavigationCount += 1
+        logger.info("[flow] a host Play canceled \(navigation.what, privacy: .public) in progress")
+    }
+
+    /// The engine navigation running now has started its Sequence.
+    private func commitEngineNavigation() {
+        guard let token = EngineNavigationContext.token,
+              engineNavigation?.token == token else { return }
+        engineNavigation?.committed = true
     }
 
     /// RESERVE THE ONE NAVIGATION SLOT for a request the engine raised, or
@@ -816,8 +1032,10 @@ open class ChapterPlayerCore {
     public func performCompletion(_ completion: CompletionActionDTO,
                                   from finished: String,
                                   endingAt position: TimeInterval) async {
-        navigationsInFlight += 1
-        defer { navigationsInFlight -= 1 }
+        cancelEngineNavigationForHost()
+        let counted = countNavigation()
+        defer { if counted { navigationsInFlight -= 1 } }
+        guard mayProceed else { return }
         heldStoryDecision = nil
         let outcome = navigator.handleCompletion(
             completion,
@@ -825,7 +1043,10 @@ open class ChapterPlayerCore {
             exists: { self.sequenceFromLoadedDocument(id: $0) != nil },
             start: { self.loadedExperience?.document.defaultSequenceId },
             currentPosition: position,
-            storyState: storyState.ledger)
+            storyState: storyState.ledger,
+            // OD-98: what the story remembers now goes with the visit this
+            // ending leaves, so a Resume of it can put that Memory back.
+            memorySnapshot: storyState.memorySnapshot)
         // A DECISION THAT FOUND NO MATCH HOLDS, and remembers what it was
         // waiting to decide, so a later Memory change can decide again
         // (OD-42). Recorded before `perform`, which does nothing for `.stay`.
@@ -853,17 +1074,16 @@ open class ChapterPlayerCore {
             return
         }
         guard held.movesOn(in: storyState.ledger) else { return }
-        guard reserveEngineNavigation("a story decision re-check") else {
+        let started = startEngineNavigation("a story decision re-check") {
+            await self.performCompletion(held.completion, from: held.sequenceId,
+                                         endingAt: held.endPosition)
+        }
+        guard started else {
             recheckPendingForHeldDecision = true
             return
         }
         heldStoryDecision = nil
         logger.info("[flow] Memory changed; the story decision at the end of '\(held.sequenceId, privacy: .public)' now matches")
-        Task { @MainActor in
-            defer { self.navigationsInFlight -= 1 }
-            await self.performCompletion(held.completion, from: held.sequenceId,
-                                         endingAt: held.endPosition)
-        }
     }
 
     /// START SENSING AN EXPLORE AREA'S EXIT AT AREA ENTRY (OD-23): the
@@ -872,27 +1092,7 @@ open class ChapterPlayerCore {
     /// `offerActivationToGate`.
     private func armAreaExit(_ exit: SegmentGateDTO) {
         gateDetection.armAreaExit(exit) { [weak self] in
-            guard let self else { return }
-            // The act AND what the story remembers, as at the boundary.
-            guard GateActivation.storyConditionsHold(exit, in: self.storyState.ledger) else { return }
-            // ONE ACT, ONE CUE, as for a tap (`offerActivationToGate`). The
-            // same grab can fire this watch and a waiting Cue's own watch, in
-            // either order: a Cue waiting for it, or one it answered a moment
-            // ago, keeps it, and the Area's watch hears the next act.
-            if let trigger = GateActivation.trigger(for: exit.type) {
-                let act = SemanticActivation(entityName: exit.targetEntity, trigger: trigger,
-                                             interactionRan: false, isAccessible: false)
-                let ledger = self.storyState.ledger
-                if self.sequenceEngine.isWaiting, let gate = self.sequenceEngine.currentGate,
-                   GateActivation.satisfies(gate: gate.authored, activation: act, state: ledger) {
-                    return
-                }
-                if let last = self.lastCueAnswered, Date().timeIntervalSince(last.at) < 0.5,
-                   GateActivation.satisfies(gate: last.gate, activation: act, state: ledger) {
-                    return
-                }
-            }
-            self.storyRegions.resolveActiveRegion()
+            _ = self?.areaExitActSensed(exit)
         }
         if let target = exit.targetEntity, !target.isEmpty,
            let trigger = GateActivation.trigger(for: exit.type) {
@@ -900,6 +1100,190 @@ open class ChapterPlayerCore {
                                            label: GateActivation.accessibleLabel(for: exit),
                                            trigger: trigger)
         }
+    }
+
+    /// THE AREA'S EXIT WATCH SENSED ITS ACT during the first pass (OD-23):
+    /// a facing dwell, an approach or a grab, from the shared detector.
+    ///
+    /// ONE ACT, ONE ANSWER (OD-121), as for a tap (`offerActivationToGate`).
+    /// The same grab can fire this watch and a waiting Cue's own watch, in
+    /// either order: a Cue waiting for it, or one it answered a moment ago,
+    /// keeps it, and the Area's watch hears the next act. The exit's Memory
+    /// conditions and the Area's exit timing apply exactly as for a tap.
+    ///
+    /// Public so the rule is tested on the runtime a headset runs, without a
+    /// detector. Returns true when the act finished the Area.
+    @discardableResult
+    public func areaExitActSensed(_ exit: SegmentGateDTO) -> Bool {
+        // The act AND what the story remembers, as at the boundary.
+        guard GateActivation.storyConditionsHold(exit, in: storyState.ledger) else { return false }
+        guard let trigger = GateActivation.trigger(for: exit.type) else {
+            // An exit no act answers (a Memory or Orchestrator exit) has
+            // nothing for a watch to sense.
+            return false
+        }
+        let act = SemanticActivation(entityName: exit.targetEntity, trigger: trigger,
+                                     interactionRan: false, isAccessible: false)
+        if sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate,
+           GateActivation.satisfies(gate: authoredGate(for: gate), activation: act, state: storyState.ledger) {
+            return false
+        }
+        return storyRegions.offerEarlyExit(act, state: storyState.ledger,
+                                           answeredACue: actWasJustSpentOnACue(act))
+    }
+
+    /// Did this act release a Cue a moment ago? Then it is spent there: one
+    /// act answers one thing (OD-121). Half a second covers the two routes
+    /// (a Cue's own watch and the Area's) reporting the same act in turn.
+    private func actWasJustSpentOnACue(_ act: SemanticActivation) -> Bool {
+        guard let last = lastCueAnswered, Date().timeIntervalSince(last.at) < 0.5 else { return false }
+        return GateActivation.satisfies(gate: last.gate, activation: act, state: storyState.ledger)
+    }
+
+    // MARK: - Explore Area: the Response and the loop (OD-96, OD-25, OD-99)
+
+    /// RUN AN AREA'S RESPONSE through the one engine path an Interaction's
+    /// response takes. Empty is Continue, which the controller performs by
+    /// letting the story go; nothing runs here for it.
+    private func runAreaResponse(_ region: StoryRegion) {
+        let actions = region.responseActions.compactMap { dto -> SegmentAction? in
+            do { return try SegmentAction(dto: dto) } catch {
+                logger.warning("[explore] Area '\(region.id)' Response carries an action this build cannot run: \(String(describing: error))")
+                return nil
+            }
+        }
+        guard !actions.isEmpty else { return }
+        logger.info("[explore] Area '\(region.id)' runs its Response: \(actions.count) action(s)")
+        sequenceEngine.performActions(actions)
+    }
+
+    /// What a looping Area is replaying, worked out once as its hold begins.
+    private struct AreaLoopMedia {
+        let regionId: String
+        /// The occurrences that loop with the Area: inside its range, and not
+        /// opted out by their own continuation.
+        let occurrences: [StoryRegionLoopOccurrence]
+        /// The occurrence each video channel is showing, so a restart of the
+        /// same clip seeks instead of building a new player.
+        var videoOnChannel: [String: String]
+    }
+    @ObservationIgnored private var areaLoopMedia: AreaLoopMedia?
+
+    /// A start this close to an occurrence's own beginning starts it from the
+    /// top. Wider than a tick, so a clip that loops on its own (which cannot
+    /// be started part-way) still rejoins the Area's loop at its place.
+    private static let areaLoopStartTolerance: TimeInterval = 0.25
+
+    private func advanceAreaLoop(_ region: StoryRegion, from previous: TimeInterval?,
+                                 to dwell: TimeInterval) {
+        if previous == nil || areaLoopMedia?.regionId != region.id {
+            let occurrences = loopingOccurrences(in: region)
+            var showing: [String: String] = [:]
+            // What each Screen shows at the boundary: the occurrence that ran
+            // up to the Area's end.
+            for occurrence in occurrences
+            where occurrence.medium == .video && occurrence.end >= region.endTime - 1e-4 {
+                showing[occurrence.channel] = occurrence.actionId
+            }
+            areaLoopMedia = AreaLoopMedia(regionId: region.id, occurrences: occurrences,
+                                          videoOnChannel: showing)
+            if !occurrences.isEmpty {
+                logger.info("[explore] Area '\(region.id)' loops \(occurrences.count) media occurrence(s) with its range")
+            }
+        }
+        guard let loop = areaLoopMedia, !loop.occurrences.isEmpty else { return }
+        performAreaLoop(StoryRegionLoopMedia.commands(for: loop.occurrences, region: region,
+                                                      from: previous, to: dwell))
+    }
+
+    /// The Area's exit released it: what runs past the Area goes back to the
+    /// authored boundary, and what ended with the Area stops.
+    private func releaseAreaLoop(_ region: StoryRegion, dwell: TimeInterval) {
+        guard let loop = areaLoopMedia, loop.regionId == region.id else { return }
+        performAreaLoop(StoryRegionLoopMedia.exitCommands(for: loop.occurrences, region: region,
+                                                          dwell: dwell))
+        areaLoopMedia = nil
+    }
+
+    /// The occurrences of the playing Sequence that loop with `region`.
+    /// Read from the document by stable action id, the same way a
+    /// continuation names them; an occurrence's own continuation wins
+    /// (`StoryHoldPlan.areaLoopCommand`). A Sequence-crossing (ambient) sound
+    /// is never the Area's to loop.
+    private func loopingOccurrences(in region: StoryRegion) -> [StoryRegionLoopOccurrence] {
+        guard let sequenceId = sequenceEngine.currentSequence?.id,
+              let sequence = loadedExperience?.document.sequences.first(where: { $0.id == sequenceId })
+        else { return [] }
+        return StoryRegionLoopMedia.occurrences(in: sequence.segments, region: region).filter { occurrence in
+            if case .playAudio(let audio) = occurrence.opening, audio.scope == .ambient { return false }
+            let authored = region.authoredContinuation(for: .occurrence(actionId: occurrence.actionId))
+            let content: StoryHoldPlan.Content = occurrence.medium == .video ? .video : .audio
+            return StoryHoldPlan.areaLoopCommand(for: authored?.behavior, exitFade: authored?.exitFade,
+                                                 on: content) == .loopWithArea
+        }
+    }
+
+    private func performAreaLoop(_ commands: [StoryRegionLoopMedia.Command]) {
+        for command in commands {
+            switch command {
+            case .stop(let occurrence):
+                switch occurrence.medium {
+                case .audio:
+                    audioExecutor.stop(channel: occurrence.channel)
+                case .video:
+                    // Only the clip this loop put there: another occurrence
+                    // may already own the Screen.
+                    guard areaLoopMedia?.videoOnChannel[occurrence.channel] == occurrence.actionId else { continue }
+                    videoExecutor.stop(channel: occurrence.channel)
+                    areaLoopMedia?.videoOnChannel[occurrence.channel] = nil
+                }
+            case .start(let occurrence, let elapsed):
+                switch occurrence.medium {
+                case .audio: startLoopedAudio(occurrence, elapsed: elapsed)
+                case .video: startLoopedVideo(occurrence, elapsed: elapsed)
+                }
+            }
+        }
+    }
+
+    private func startLoopedAudio(_ occurrence: StoryRegionLoopOccurrence, elapsed: TimeInterval) {
+        guard case .playAudio(let dto) = occurrence.opening,
+              let action = try? SegmentAction(dto: .playAudio(dto)),
+              case .playAudio(let audio) = action else { return }
+        let from = elapsed <= Self.areaLoopStartTolerance ? 0 : elapsed
+        if !audioManager.playForAreaLoop(audio, elapsed: from) {
+            logger.info("[explore] '\(occurrence.channel)' keeps its own clock: it cannot start \(String(format: "%.2f", from))s in")
+        }
+    }
+
+    private func startLoopedVideo(_ occurrence: StoryRegionLoopOccurrence, elapsed: TimeInterval) {
+        guard case .playVideo(let dto) = occurrence.opening else { return }
+        let channel = occurrence.channel
+        let from = elapsed <= Self.areaLoopStartTolerance ? 0 : elapsed
+        let sourceTime = max(0, dto.sourceIn ?? 0) + from
+        if !dto.loop, let out = dto.sourceOut, sourceTime >= out {
+            // Its part of this loop is already over.
+            return
+        }
+        let showing = areaLoopMedia?.videoOnChannel[channel] == occurrence.actionId
+            && videoManager.playRequestedChannelNames.contains(channel)
+        if showing {
+            // A clip that loops on its own keeps its own loop past its start.
+            if dto.loop && from > 0 { return }
+            // The same clip is on this Screen: seek, then make sure it runs
+            // (one that reached its end has stopped by itself). The engine's
+            // own seek uses this same pair (`alignToSeek`).
+            videoExecutor.seek(channel: channel, to: sourceTime)
+            if videoManager.pauseForExploreHold(channel: channel) {
+                videoManager.releaseExploreHold(channel: channel, resume: !sequenceEngine.isPaused)
+            }
+            return
+        }
+        guard let action = try? SegmentAction(dto: .playVideo(dto)),
+              case .playVideo(let video) = action else { return }
+        videoExecutor.play(video)
+        if from > 0, !dto.loop { videoExecutor.seek(channel: channel, to: sourceTime) }
+        areaLoopMedia?.videoOnChannel[channel] = occurrence.actionId
     }
 
     // MARK: - Sequence control
@@ -916,17 +1300,30 @@ open class ChapterPlayerCore {
     /// path. `startingAtSegmentIndex` is non-zero only for a resumed visit.
     public func playSequence(_ sequence: SequenceDefinition,
                              startingAtSegmentIndex startIndex: Int = 0) async {
+        await enterSequence(sequence, startingAtSegmentIndex: startIndex)
+    }
+
+    /// The performer itself. Returns false when it stopped without starting
+    /// the Sequence because a host Play canceled the engine navigation it was
+    /// carrying out (OD-111).
+    @discardableResult
+    private func enterSequence(_ sequence: SequenceDefinition,
+                               startingAtSegmentIndex startIndex: Int) async -> Bool {
+        // A HOST PLAY WINS (OD-111, owner decision): called by a host (never
+        // inside an engine navigation's Task), this cancels an engine Go To
+        // or ending still in flight, and proceeds.
+        cancelEngineNavigationForHost()
         // COUNTED HERE, THE ONE PERFORMER EVERY ENTRY GOES THROUGH (OD-46):
         // a host's Play (MaestroVision calls this directly, never `navigate`),
         // `perform(.enter)` and the QA seams. While it waits on the space,
         // the scene and the skybox, an engine Go To or completion is dropped
-        // rather than racing it. Nests with the other counters, and the slot
-        // is released with no suspension after `sequenceEngine.play`, so the
-        // new Sequence's own t=0 Go To is still accepted. Whether a host Play
-        // during an engine jump should be refused too is owner decision
-        // pending; today it runs.
-        navigationsInFlight += 1
-        defer { navigationsInFlight -= 1 }
+        // rather than racing it. An engine navigation's slot already counts
+        // it. The slot is released with no suspension after
+        // `sequenceEngine.play`, so the new Sequence's own t=0 Go To is still
+        // accepted.
+        let counted = countNavigation()
+        defer { if counted { navigationsInFlight -= 1 } }
+        guard mayProceed else { return false }
         // A NEW SEQUENCE IS PLAYING, so no earlier ending is still deciding.
         heldStoryDecision = nil
         // A HOST THAT JUMPS STRAIGHT INTO A SEQUENCE still gets a session, so
@@ -936,6 +1333,7 @@ open class ChapterPlayerCore {
         // every entry would reset the memory on the first Go To.
         if !storyState.isSessionActive { beginChapterPlaybackSession() }
         await applySequencePresentation(sequence)
+        guard mayProceed else { return false }
         // THE SCENE EXISTS BEFORE ANYTHING IS ASKED OF IT. The same race as
         // the skybox wait below, one level up: a host that plays as soon as
         // it has opened (an autoplaying Chapter, a Play pressed while the
@@ -951,11 +1349,12 @@ open class ChapterPlayerCore {
         if immersiveSpaceState == .open,
            currentDocumentForStyling()?.entities.isEmpty == false, !documentEntities.hasMaterialized {
             let deadline = Date().addingTimeInterval(5.0)
-            while Date() < deadline, !documentEntities.hasMaterialized {
+            while Date() < deadline, !documentEntities.hasMaterialized, mayProceed {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
             logger.info("[scene] materialize wait finished (built=\(self.documentEntities.hasMaterialized))")
         }
+        guard mayProceed else { return false }
         // The FIRST play of a session races the ImmersiveSpace open:
         // openSpace returns when the system creates the scene, but the
         // consumer's RealityView registers the skybox shell a beat later
@@ -965,11 +1364,15 @@ open class ChapterPlayerCore {
         if sequence.presentation == .immersive, sequence.immersiveBackdrop != nil,
            videoManager.videoEntityRegistry["skybox"] == nil {
             let deadline = Date().addingTimeInterval(5.0)
-            while Date() < deadline, videoManager.videoEntityRegistry["skybox"] == nil {
+            while Date() < deadline, videoManager.videoEntityRegistry["skybox"] == nil, mayProceed {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
             logger.info("[backdrop] skybox registration wait finished (registered=\(self.videoManager.videoEntityRegistry["skybox"] != nil))")
         }
+        // THE LAST CHECK, with no suspension between it and the start below:
+        // a canceled engine navigation never starts its Sequence.
+        guard mayProceed else { return false }
+        commitEngineNavigation()
         applySequenceBackdrop(sequence)
         // SEQUENCE-LOCAL REST: place this sequence's objects where IT
         // stages them (and return anything the previous sequence placed
@@ -987,6 +1390,7 @@ open class ChapterPlayerCore {
             applyPanelStyles(for: dto, in: document)
         }
         sequenceEngine.play(sequence: sequence, startingAtSegmentIndex: startIndex)
+        return true
     }
 
     /// The document panel styling resolves against — the load-time snapshot
@@ -1086,7 +1490,19 @@ open class ChapterPlayerCore {
                 return
             }
             let isVideo = isVideoOccurrence(actionId)
-            switch StoryHoldPlan.command(for: behavior, on: isVideo ? .video : .audio) {
+            let content: StoryHoldPlan.Content = isVideo ? .video : .audio
+            // A LOOPING Area (OD-25, OD-99): media loops with it unless its
+            // own continuation opts out. A play-once Area keeps the table.
+            let plan: StoryHoldPlan.Command
+            if let region = storyRegions.active?.region, region.playbackMode == .loop {
+                plan = StoryHoldPlan.areaLoopCommand(
+                    for: behavior,
+                    exitFade: region.authoredContinuation(for: target)?.exitFade,
+                    on: content)
+            } else {
+                plan = StoryHoldPlan.command(for: behavior, on: content)
+            }
+            switch plan {
             case .pause:
                 // HOLD. Pause where the authored pass left it; a clip that
                 // already ended is already showing its last frame.
@@ -1105,6 +1521,10 @@ open class ChapterPlayerCore {
             case .leaveRunning:
                 // Continuing means the content keeps running on its own clock
                 // while authored time is parked, which it is already doing.
+                break
+            case .loopWithArea:
+                // The Area's loop restarts it at its place in each loop
+                // (`advanceAreaLoop`); nothing to do as the hold begins.
                 break
             case .refuse(let reason):
                 logger.warning("[explore] '\(channel)' keeps playing: \(reason)")
@@ -1138,7 +1558,7 @@ open class ChapterPlayerCore {
             if videoManager.pauseForExploreHold(channel: Self.backdropVideoChannel) {
                 storyHeldVideoChannels.insert(Self.backdropVideoChannel)
             }
-        case .leaveRunning:
+        case .leaveRunning, .loopWithArea:
             break
         case .stop, .refuse:
             logger.warning("[explore] Environment cue '\(cueId)' keeps playing: \(StoryHoldPlan.backdropStopRefusal)")
@@ -1152,7 +1572,12 @@ open class ChapterPlayerCore {
     /// §6); an absent continuation used to do nothing at all here, so the
     /// documented default kept playing on device while the Sequence clock
     /// stood still, and came back out of sync with its own Timeline.
+    ///
+    /// A LOOPING Area pauses nothing by default: video and sound nobody
+    /// configured loop with it instead (OD-25), restarted by
+    /// `advanceAreaLoop`.
     private func applyDefaultStoryHold(for region: StoryRegion) {
+        guard region.playbackMode == .playOnce else { return }
         var configured: Set<String> = []
         for continuation in region.continuations {
             if case .occurrence(let actionId) = continuation.target,
@@ -1183,6 +1608,7 @@ open class ChapterPlayerCore {
         }
         storyHeldVideoChannels.removeAll()
         storyHeldAudioChannels.removeAll()
+        areaLoopMedia = nil
     }
 
     /// FADE THIS CONTENT OUT AS THE STORY RESUMES.
@@ -1255,13 +1681,30 @@ open class ChapterPlayerCore {
             entityName: entityName, trigger: trigger,
             interactionRan: interactionRan, isAccessible: isAccessible)
 
+        // A WAITING CHOICE HEARS IT FIRST (OD-8). A tap or look-and-pinch on
+        // one of its buttons, or an act on an Object an option names, is a
+        // pick; any other act does not answer a Choice
+        // (`GateActivation.satisfies` refuses it below).
+        if sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate {
+            let authored = authoredGate(for: gate)
+            if GateActivation.waitsForChoice(authored) {
+                if let optionId = choices.optionId(forEntityName: entityName) {
+                    return pickChoiceOption(optionId)
+                }
+                if let option = GateActivation.choiceOption(for: authored, activation: activation,
+                                                            state: storyState.ledger) {
+                    return pickChoiceOption(option.optionId)
+                }
+            }
+        }
+
         // THE WAITING CUE HEARS IT FIRST. One act, one Cue: an act that
         // releases the Cue the story is waiting at is spent there.
         if sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate,
            // THE ACT **AND** WHAT THE STORY REMEMBERS. A condition an author
            // added to a gate is a requirement, so "tap the door once you have
            // the key" cannot be opened by the tap alone.
-           GateActivation.satisfies(gate: gate.authored, activation: activation,
+           GateActivation.satisfies(gate: authoredGate(for: gate), activation: activation,
                                     state: storyState.ledger) {
             logger.info("[gate] satisfied by \(isAccessible ? "an accessible" : "a physical") \(trigger.kindName) activation on '\(entityName ?? "—")'")
             sequenceEngine.satisfyGate()
@@ -1271,13 +1714,193 @@ open class ChapterPlayerCore {
         // EARLY ACTS COUNT FROM AREA ENTRY (OD-23). While an Explore Area's
         // first pass plays, the act its exit asks for finishes the Area now,
         // so the story does not stall at its end. The Area judges it by the
-        // same rule (`StoryRegionRuntime.acceptsEarlyExit`); at its boundary
-        // it declines, because there the exit is the waiting Cue above.
-        if storyRegions.offerEarlyExit(activation, state: storyState.ledger) {
+        // same rule (`StoryRegionRuntime.acceptsEarlyExit`), with its exit
+        // timing (OD-121: by default a plain tap counts only while waiting);
+        // at its boundary it declines, because there the exit is the waiting
+        // Cue above. An act a Cue spent a moment ago answers nothing else.
+        if storyRegions.offerEarlyExit(activation, state: storyState.ledger,
+                                       answeredACue: actWasJustSpentOnACue(activation)) {
             logger.info("[explore] Area exit satisfied early by \(isAccessible ? "an accessible" : "a physical") \(trigger.kindName) activation on '\(entityName ?? "—")'")
             return true
         }
         return false
+    }
+
+    // MARK: - The authored Cue
+
+    /// THE CUE AS AUTHORED, from the document, for the gate the engine is
+    /// waiting at. The engine's runtime mirror (`SegmentGate.authored`)
+    /// carries only what the engine itself needs and leaves out the Choice
+    /// (OD-8), so every question about a waiting Cue asks this instead: a
+    /// Choice Cue read through the mirror looked like a plain tap Cue that
+    /// any tap continued. Falls back to the mirror when the document has no
+    /// matching Cue (a host that plays a Sequence the document lacks).
+    func authoredGate(for gate: SegmentGate) -> SegmentGateDTO {
+        guard let sequenceId = sequenceEngine.currentSequence?.id,
+              let sequence = currentDocumentForStyling()?.sequences.first(where: { $0.id == sequenceId })
+        else { return gate.authored }
+        let index = sequenceEngine.currentSegmentIndex
+        guard sequence.segments.indices.contains(index),
+              let authored = sequence.segments[index].gate,
+              authored.type == gate.type.authored,
+              authored.prompt == gate.prompt,
+              authored.targetEntity == gate.targetEntity
+        else { return gate.authored }
+        return authored
+    }
+
+    // MARK: - The viewer-facing Choice (OD-8)
+
+    /// The story began waiting at a Choice Cue: show its question and options.
+    private func beginChoiceWait(_ gate: SegmentGateDTO) {
+        choiceWait = ChoiceWait(gate: gate, visit: activeVisitID,
+                                sequenceId: sequenceEngine.currentSequence?.id,
+                                segmentIndex: sequenceEngine.currentSegmentIndex,
+                                began: sequenceEngine.totalElapsed)
+        let definitions = currentDocumentForStyling()?.storyState ?? []
+        choices.show(ChoicePlan.plan(for: gate, definitions: definitions))
+        // An option that names an Object can be picked by acting on it, so
+        // the Object offers that option to assistive technology too.
+        for option in gate.choice?.options ?? [] {
+            guard let target = option.targetEntity, !target.isEmpty,
+                  let choice = gate.choice else { continue }
+            interactions.setGateAction(
+                entityName: target,
+                label: choice.displayLabel(
+                    for: option,
+                    definition: choice.stateId.flatMap { id in definitions.first { $0.id == id } }),
+                trigger: .tap)
+        }
+    }
+
+    /// The Choice Cue resolved however it did: picked, timed out, stopped or
+    /// seeked past. Hides the options; a timeout with nobody picking takes
+    /// the Choice's timeout option, when it has one.
+    private func endChoiceWait() {
+        guard let wait = choiceWait else { return }
+        choiceWait = nil
+        choices.hide()
+        guard !wait.picked, let timeout = wait.gate.timeout,
+              let resolution = wait.gate.choice?.resolveTimeout() else { return }
+        // THE ENGINE'S TIMER RELEASED IT, not a stop or a seek: the engine is
+        // still playing and unpaused (its timer never fires while paused),
+        // and the wait lasted the timeout on the pause-aware clock.
+        guard sequenceEngine.isPlaying, !sequenceEngine.isPaused,
+              sequenceEngine.totalElapsed - wait.began >= timeout - 0.05 else { return }
+        logger.info("[choice] the Cue timed out; taking its timeout option '\(resolution.option.optionId, privacy: .public)'")
+        if let mutation = resolution.mutation { storyState.apply(mutation) }
+        if let path = resolution.path {
+            startEngineNavigation("a Choice's timeout Path") {
+                self.storyRegions.teardown()
+                await self.navigate(path, source: .host)
+            }
+        }
+    }
+
+    /// THE VIEWER PICKED AN OPTION (OD-8). The one route every picker takes:
+    /// a button tapped or looked at and pinched, a VoiceOver Activate, an
+    /// act on an Object an option names, a host or a test.
+    ///
+    /// The resolution is ChapterScript's (`GateActivation.pick`): the Cue's
+    /// Memory conditions must hold, and the option must be one of its own.
+    /// Then, in this order: the Memory records what was chosen, the options
+    /// go, and the option's Path is followed through the one navigator (a
+    /// Path that goes nowhere, or no Path, continues the Cue here).
+    ///
+    /// Returns true when the pick was taken.
+    @discardableResult
+    public func pickChoiceOption(_ optionId: String) -> Bool {
+        guard sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate,
+              var wait = choiceWait, !wait.picked else { return false }
+        let authored = authoredGate(for: gate)
+        let resolution: CueChoiceResolution
+        switch GateActivation.pick(optionId, on: authored, state: storyState.ledger) {
+        case .success(let resolved):
+            resolution = resolved
+        case .failure(let refusal):
+            logger.info("[choice] pick '\(optionId, privacy: .public)' refused: \(String(describing: refusal), privacy: .public)")
+            return false
+        }
+        wait.picked = true
+        choiceWait = wait
+        let answered = wait
+        choices.hide()
+        logger.info("[choice] the viewer picked '\(optionId, privacy: .public)'")
+        // MEMORY FIRST, so a Path that is itself a branch on this Memory
+        // already sees the pick.
+        if let mutation = resolution.mutation { storyState.apply(mutation) }
+        guard let path = resolution.path else {
+            sequenceEngine.satisfyGate()
+            return true
+        }
+        let source = NavigationSource.interaction(entity: authored.targetEntity ?? "",
+                                                  interactionId: optionId)
+        let started = startEngineNavigation("a Choice's Path") {
+            self.storyRegions.teardown()
+            await self.navigate(path, source: source)
+            // A Path that went nowhere (a branch with no match, a refusal)
+            // leaves the story at this Cue; the pick still answered it.
+            if self.isStillWaiting(at: answered) { self.sequenceEngine.satisfyGate() }
+        }
+        if !started {
+            // Another navigation holds the slot (OD-46): the pick is recorded
+            // and the Cue continues here rather than leaving the story stuck.
+            logger.info("[choice] the Path was dropped: another navigation is in progress")
+            sequenceEngine.satisfyGate()
+        }
+        return true
+    }
+
+    /// Is the story still waiting at the Choice Cue `wait` describes?
+    private func isStillWaiting(at wait: ChoiceWait) -> Bool {
+        sequenceEngine.isWaiting
+            && activeVisitID == wait.visit
+            && sequenceEngine.currentSequence?.id == wait.sequenceId
+            && sequenceEngine.currentSegmentIndex == wait.segmentIndex
+    }
+
+    // MARK: - Comfort (OD-50)
+
+    /// CARRY OUT WHAT A COMFORT SIGNAL ASKS (OD-50, owner decision). The
+    /// system paused or shrank video for comfort: the whole story pauses
+    /// with it, through the transport's own `pause()`, and a short calm
+    /// message says so. The system resumed playback: a story this paused
+    /// resumes. Very high heat: a warning only, nothing pauses.
+    ///
+    /// Never resumes a pause the person made, and never pauses a story that
+    /// is not playing.
+    public func handleComfortResponse(_ response: ComfortSignals.Response) {
+        switch response {
+        case .pauseStory(let message):
+            guard sequenceEngine.isPlaying, !sequenceEngine.isPaused else { return }
+            sequenceEngine.pause()
+            isStoryPausedForComfort = true
+            comfortNotice.show(message)
+            logger.info("[comfort] the story paused with the system's comfort pause")
+        case .resumeStory:
+            guard isStoryPausedForComfort else { return }
+            isStoryPausedForComfort = false
+            // The person may have resumed, or stopped, in the meantime.
+            if sequenceEngine.isPlaying, sequenceEngine.isPaused { sequenceEngine.resume() }
+            comfortNotice.show(comfortSignals.activeWarning)
+            logger.info("[comfort] the story resumed with the system")
+        case .showWarning(let message):
+            // A comfort pause's message stays up; the warning shows when it goes.
+            guard !isStoryPausedForComfort else { return }
+            comfortNotice.show(message)
+        case .clearWarning:
+            guard !isStoryPausedForComfort else { return }
+            comfortNotice.hide()
+        }
+    }
+
+    /// The story is no longer paused, but not because the system resumed:
+    /// the person did. The comfort pause is over, and its message goes (a
+    /// heat warning still in force comes back).
+    private func comfortPauseEndedElsewhereIfResumed() {
+        guard isStoryPausedForComfort, !sequenceEngine.isPaused else { return }
+        isStoryPausedForComfort = false
+        comfortNotice.show(comfortSignals.activeWarning)
     }
 
     // MARK: - Performing navigation
@@ -1315,7 +1938,28 @@ open class ChapterPlayerCore {
             // because entering is entering, and they differ in the VISIT the
             // navigator handed back.
             let startIndex = resumingFrom.map { segmentIndex(of: next, atAuthoredTime: $0) } ?? 0
-            await playSequence(next, startingAtSegmentIndex: startIndex)
+            // Read now: the navigator's answer belongs to the request that
+            // produced this outcome.
+            let memoryToRestore = resumingFrom != nil ? navigator.restoredMemorySnapshot : nil
+            // A host Play that canceled this (engine) navigation while it
+            // waited on the space or the scene has already won (OD-111):
+            // nothing of this visit is recorded.
+            guard await enterSequence(next, startingAtSegmentIndex: startIndex) else { return }
+
+            // RESUME RESTORES THE MEMORY THE VISIT WAS LEFT WITH (OD-98,
+            // owner decision). After the start, so the visit that was left
+            // is already stopped and cannot react to it, and before the
+            // resumed visit's segment loop first runs (its Task starts after
+            // this turn), so its Cues and branches read what the viewer had
+            // when they left. Entry counters are kept: a Return is an entry,
+            // and a counter counts the whole run. Only a Resume carries a
+            // snapshot; a Restart or a fresh visit leaves Memory as it stands.
+            if let memoryToRestore {
+                let counters = Set((currentDocumentForStyling()?.storyState ?? [])
+                    .filter { $0.countsEntriesOfSequenceId != nil }
+                    .map(\.id))
+                storyState.restore(memoryToRestore, keeping: counters)
+            }
 
             // ── WHAT A VISIT OWNS, RESTORED OR RE-ARMED ─────────────────────
             //
@@ -1335,6 +1979,7 @@ open class ChapterPlayerCore {
         case .finish:
             heldStoryDecision = nil
             sequenceEngine.stop()
+            comfortPauseEndedElsewhereIfResumed()
             activeSequenceId = nil
             activeVisitID = nil
             visitLedgers.removeAll()
@@ -1357,8 +2002,11 @@ open class ChapterPlayerCore {
     /// Ask the navigator to do something, then do it.
     @MainActor
     public func navigate(_ intent: NavigationIntent, source: NavigationSource = .host) async {
-        navigationsInFlight += 1
-        defer { navigationsInFlight -= 1 }
+        // A host's own request wins over an engine navigation in flight (OD-111).
+        cancelEngineNavigationForHost()
+        let counted = countNavigation()
+        defer { if counted { navigationsInFlight -= 1 } }
+        guard mayProceed else { return }
         // `.start` IS THE BEGINNING OF A CHAPTER PLAYBACK SESSION. Seeding here
         // rather than inside the navigator keeps the navigator pure, and keeps
         // the one thing that resets Story State at the one place a Chapter
@@ -1372,7 +2020,9 @@ open class ChapterPlayerCore {
             currentPosition: sequenceEngine.sequenceAnimationTime,
             // A BRANCH IS RESOLVED AGAINST THE RUNNING SESSION, by the shared
             // evaluator. Nothing here decides which case wins.
-            storyState: storyState.ledger)
+            storyState: storyState.ledger,
+            // OD-98: the Memory of the visit this request leaves goes with it.
+            memorySnapshot: storyState.memorySnapshot)
         await perform(outcome)
     }
 
@@ -1885,6 +2535,9 @@ open class ChapterPlayerCore {
     }
 
     public func stopSequence(fullReset: Bool = false) {
+        // A host's Stop is the person's request too (OD-111): an engine Go To
+        // or ending still in flight must not start a Sequence after it.
+        cancelEngineNavigationForHost()
         sequenceEngine.stop(resetEntities: true, fullReset: fullReset)
         // The backdrop video channel is PROTECTED from stopAll() so its
         // VideoPlayerComponent survives sequence-to-sequence rebinds
@@ -1896,6 +2549,12 @@ open class ChapterPlayerCore {
         activeSequenceId = nil
         // Stopped: no ending is still deciding (OD-42).
         heldStoryDecision = nil
+        // Stopped: the options and any comfort pause go with the story.
+        endChoiceWait()
+        if isStoryPausedForComfort {
+            isStoryPausedForComfort = false
+            comfortNotice.show(comfortSignals.activeWarning)
+        }
     }
 
     /// Look up `id` in the currently-loaded ChapterScript document,

@@ -132,17 +132,26 @@ public struct LiveDevExperienceProvider: ExperienceProvider {
     /// paying a second Bonjour resolve. Fired exactly once per `load()`,
     /// after the bulk probe has settled.
     public let onTransportResolved: (@Sendable (LiveTransport) -> Void)?
+    /// Reports the Chapter format the Mac states on `/chapter.json` (its
+    /// `X-Chapter-Format` header, OD-112), or nil when it states none: a Mac
+    /// built before the version rode the link, so an older format. Fired once
+    /// per `load()`, before decoding. The host compares it with
+    /// `LiveLinkFormat.current` and WARNS (`LiveLinkFormat.mismatchWarning`);
+    /// the load never refuses over it.
+    public let onPeerFormatVersion: (@Sendable (Int?) -> Void)?
 
     public init(
         descriptor: LiveServerDescriptor,
         prefetchProgress: LivePrefetchProgress? = nil,
         onDocumentRevision: (@Sendable (Int) -> Void)? = nil,
-        onTransportResolved: (@Sendable (LiveTransport) -> Void)? = nil
+        onTransportResolved: (@Sendable (LiveTransport) -> Void)? = nil,
+        onPeerFormatVersion: (@Sendable (Int?) -> Void)? = nil
     ) {
         self.descriptor = descriptor
         self.prefetchProgress = prefetchProgress
         self.onDocumentRevision = onDocumentRevision
         self.onTransportResolved = onTransportResolved
+        self.onPeerFormatVersion = onPeerFormatVersion
     }
 
     public func load() async throws -> LoadedExperience {
@@ -160,6 +169,9 @@ public struct LiveDevExperienceProvider: ExperienceProvider {
         var request = URLRequest(url: docURL)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // THE FORMAT THIS PLAYER READS (OD-112), so the Mac can warn its
+        // author when the two differ.
+        request.setValue(String(LiveLinkFormat.current), forHTTPHeaderField: LiveLinkFormat.headerName)
 
         let document: ChapterDocument
         do {
@@ -174,8 +186,9 @@ public struct LiveDevExperienceProvider: ExperienceProvider {
             if let raw = http.value(forHTTPHeaderField: "X-Chapter-Rev"), let revision = Int(raw) {
                 onDocumentRevision?(revision)
             }
-            let migrated = try Migrator.migrate(data)
-            document = try ChapterScriptFormat.makeDecoder().decode(ChapterDocument.self, from: migrated)
+            onPeerFormatVersion?(LiveLinkFormat.version(
+                fromHeader: http.value(forHTTPHeaderField: LiveLinkFormat.headerName)))
+            document = try Self.decodeLiveDocument(data)
         } catch let err as ExperienceLoaderError {
             throw err
         } catch {
@@ -228,6 +241,24 @@ public struct LiveDevExperienceProvider: ExperienceProvider {
             mediaResolver: resolver,
             rootURL: baseURL
         )
+    }
+
+    /// THE LIVE LINK CONNECTS BUT WARNS (OD-112). A Chapter FILE newer than
+    /// this build is refused (`Migrator.MigrationError.sourceVersionTooNew`,
+    /// OD-47); a Mac on a newer build is not a file, and refusing it left the
+    /// headset unable to connect at all. Its document is decoded as it
+    /// stands, through the tolerant decoders, and the host shows the version
+    /// warning (`onPeerFormatVersion`). A document that does not decode still
+    /// fails, as before.
+    static func decodeLiveDocument(_ data: Data) throws -> ChapterDocument {
+        let migrated: Data
+        do {
+            migrated = try Migrator.migrate(data)
+        } catch Migrator.MigrationError.sourceVersionTooNew(let source, let supported) {
+            logger.warning("The Mac's Chapter is format \(source), this player reads format \(supported): decoding it as it stands")
+            migrated = data
+        }
+        return try ChapterScriptFormat.makeDecoder().decode(ChapterDocument.self, from: migrated)
     }
 
     /// Resolve the discovered Bonjour endpoint to a concrete `http://host:port` URL.
@@ -286,9 +317,17 @@ public struct LiveDevExperienceProvider: ExperienceProvider {
 public final class LiveSubscription {
     private var task: Task<Void, Never>?
 
-    public init(descriptor: LiveServerDescriptor, onChanged: @MainActor @escaping () -> Void) {
+    /// - Parameter onOrchestratorMessage: the Mac sent the orchestrator
+    ///   message (`event: orchestrator`, TODO-108). A player continues a
+    ///   waiting Orchestrator or Either Cue with
+    ///   `ChapterPlayerCore.receiveHostMessage()`. Nil ignores it, as a
+    ///   player built before the message did.
+    public init(descriptor: LiveServerDescriptor,
+                onChanged: @MainActor @escaping () -> Void,
+                onOrchestratorMessage: (@MainActor () -> Void)? = nil) {
         self.task = Task { [weak self] in
-            await self?.run(descriptor: descriptor, onChanged: onChanged)
+            await self?.run(descriptor: descriptor, onChanged: onChanged,
+                            onOrchestratorMessage: onOrchestratorMessage)
         }
     }
 
@@ -299,7 +338,8 @@ public final class LiveSubscription {
 
     private func run(
         descriptor: LiveServerDescriptor,
-        onChanged: @MainActor @escaping () -> Void
+        onChanged: @MainActor @escaping () -> Void,
+        onOrchestratorMessage: (@MainActor () -> Void)?
     ) async {
         // Resolve once via the same path the provider uses, then stream lines.
         let provider = LiveDevExperienceProvider(descriptor: descriptor)
@@ -315,6 +355,7 @@ public final class LiveSubscription {
             var request = URLRequest(url: url)
             request.timeoutInterval = .infinity
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            request.setValue(String(LiveLinkFormat.current), forHTTPHeaderField: LiveLinkFormat.headerName)
 
             do {
                 let (bytes, response) = try await URLSession.shared.bytes(for: request)
@@ -329,6 +370,8 @@ public final class LiveSubscription {
                     if Task.isCancelled { break }
                     if line.hasPrefix("event: doc-changed") {
                         await MainActor.run { onChanged() }
+                    } else if line.hasPrefix("event: orchestrator"), let onOrchestratorMessage {
+                        await MainActor.run { onOrchestratorMessage() }
                     }
                 }
             } catch {

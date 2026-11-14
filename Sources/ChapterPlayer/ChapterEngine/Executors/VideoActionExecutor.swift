@@ -48,6 +48,10 @@ public final class VideoActionExecutor: VideoActionExecutorProtocol {
         self.videoManager = videoManager
     }
 
+    /// Plays on the action's CHANNEL. An immersive clip on one of several
+    /// Immersive Tracks (OD-9) carries that track's own channel, so it gets
+    /// its own shell and mount (`ImmersiveMount`); nothing here routes by
+    /// track id.
     public func play(_ action: VideoAction) {
         videoManager.play(action: action)
     }
