@@ -331,13 +331,25 @@ public enum TitleMesh {
         // the geometry exactly as the editors bake it. Absent ⇒ baseline,
         // the extruder's own layout, so older titles do not move.
         let offsetY = anchorOffsetY(alignment: spec.alignmentY, bounds: settled)
-        let shift = SIMD3<Float>(0, frameShift + offsetY, 0)
+        let offsetX = anchorOffsetX(alignment: spec.alignmentX, bounds: settled)
+        let shift = SIMD3<Float>(offsetX, frameShift + offsetY, 0)
         let contents = translatedContents(laidOut.contents, by: shift)
         let mesh = simd_length(shift) > 1e-7 ? try realize(contents) : laidOut
         return Result(mesh: mesh,
                       materials: materials(for: spec, slotCount: slotCount),
                       contents: contents,
                       bevelSkippedAfterCrash: bevelSkippedAfterCrash)
+    }
+
+    /// Mirror of `MaestroKit.TitleGeometryContract.anchorOffsetX`: Center
+    /// centers the line on the Object's position, Trailing ends it there;
+    /// Leading and an absent alignment keep the extruder's layout.
+    static func anchorOffsetX(alignment: TextAlignmentX?, bounds: BoundingBox) -> Float {
+        switch alignment {
+        case .center?:   return -(bounds.min.x + bounds.max.x) / 2
+        case .trailing?: return -bounds.max.x
+        case .leading?, .justified?, .natural?, nil: return 0
+        }
     }
 
     /// Mirror of `MaestroKit.TitleGeometryContract.anchorOffsetY`.
