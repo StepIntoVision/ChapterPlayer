@@ -29,6 +29,16 @@ private let docEntityLogger = Logger(
 public final class DocumentEntityLoader {
 
     private let factory: EntityFactory
+
+    /// Which placeholders a TEST SESSION draws as gray stand-ins (OD-143,
+    /// `EntityFactory.placeholderStandIns`). `.none` for an audience. A
+    /// change takes effect at the next `materialize`, and `isCurrent` reports
+    /// a scene built the other way as stale, so a host that changes it and
+    /// asks for a matching scene gets one.
+    public var placeholderStandIns: PlaceholderStandIns {
+        get { factory.placeholderStandIns }
+        set { factory.placeholderStandIns = newValue }
+    }
     private weak var entityExecutor: EntityActionExecutor?
     private weak var videoManager: VideoPlaybackManager?
     /// Optional name of an ambient scene child (e.g. a Reality Composer Pro
@@ -65,7 +75,7 @@ public final class DocumentEntityLoader {
     /// What the standing scene was built from, so a caller that only wants
     /// the scene to MATCH can ask (`isCurrent`) instead of rebuilding.
     private var builtFrom: (entities: [EntityDefinition], presets: [ParticleEmitterPreset],
-                            root: ObjectIdentifier, hadResolver: Bool)?
+                            root: ObjectIdentifier, hadResolver: Bool, standIns: PlaceholderStandIns)?
 
     /// True once a document's entities stand in a scene. A Sequence started
     /// before this fires its opening reveals at an empty registry.
@@ -82,12 +92,14 @@ public final class DocumentEntityLoader {
             && builtFrom.hadResolver == (mediaResolver != nil)
             && builtFrom.entities == document.entities
             && builtFrom.presets == document.particlePresets
+            && builtFrom.standIns == factory.placeholderStandIns
     }
 
     public func materialize(document: ChapterDocument, sceneRoot: Entity?, mediaResolver: MediaResolver? = nil) {
         unload()
         builtFrom = sceneRoot.map {
-            (document.entities, document.particlePresets, ObjectIdentifier($0), mediaResolver != nil)
+            (document.entities, document.particlePresets, ObjectIdentifier($0), mediaResolver != nil,
+             factory.placeholderStandIns)
         }
 
         // Give the factory the resolver so image entities ("Add Image"
@@ -253,6 +265,26 @@ public final class DocumentEntityLoader {
     /// `SpatialAudioConfigDTO.attachToEntity`. This is deliberately a lookup
     /// rather than a stored map: `materialize` builds a FRESH anchor each
     /// time, so a cached dictionary would go stale on the next sequence.
+    /// Bring a Screen's gray stand-in (OD-143) up to date after an edit the
+    /// host applied IN PLACE rather than by rebuilding the Screen (a style
+    /// change keeps a playing video bound). The old stand-in goes; a Screen
+    /// that is still a placeholder gets a fresh one at its new size, label
+    /// and corners, hidden while footage plays on it; a Screen that has
+    /// become real keeps none.
+    public func refreshScreenStandIn(_ definition: EntityDefinition) {
+        guard let screen = entityExecutor?.entityRegistry[definition.id] else { return }
+        for child in Array(screen.children) where child.components.has(PlaceholderStandInComponent.self) {
+            child.removeFromParent()
+        }
+        guard factory.placeholderStandIns != .none,
+              definition.kind == .placeholder, definition.isVideoDestination else { return }
+        let standIn = PlaceholderStandIn.screen(for: definition)
+        let playing = screen.components[ModelComponent.self]?.materials
+            .contains { $0 is VideoMaterial } ?? false
+        standIn.isEnabled = !playing
+        screen.addChild(standIn)
+    }
+
     public func entity(named id: String) -> Entity? {
         anchor?.children.first { $0.name == id }
     }

@@ -33,7 +33,17 @@ public final class EntityFactory {
 
     public init() {
         ParticleBurstOnRevealComponent.registerComponent()
+        PlaceholderStandInComponent.registerComponent()
     }
+
+    /// A TEST SESSION DRAWS PLACEHOLDERS (OD-143). `.none` by default, so
+    /// an audience never sees a gray box. A host running a session where a
+    /// person tries a Chapter that is still being made chooses how many the
+    /// runtime builds (`PlaceholderStandIns`), and each is a gray stand-in
+    /// with its name (`PlaceholderStandIn`), so a template can be played and
+    /// its Taps and Cues tried. Takes effect at the next materialize
+    /// (`DocumentEntityLoader.placeholderStandIns`).
+    public var placeholderStandIns: PlaceholderStandIns = .none
 
     /// Resolver used to locate on-disk URLs for image entities (so an
     /// "Add Image" reveal renders as an in-scene textured plane). Set by
@@ -102,8 +112,14 @@ public final class EntityFactory {
             // gray box can reach an audience) and the videos authored on it
             // have somewhere to play.
             entity = makeVideoPanel(definition)
+            // In a test session the Screen shows a gray stand-in until a
+            // video binds to it; the video manager hides it while footage
+            // plays (`PlaceholderStandIn.setScreenStandIns`).
+            if placeholderStandIns != .none {
+                entity.addChild(PlaceholderStandIn.screen(for: definition))
+            }
         case .placeholder:
-            // BLOCKING CONTENT BUILDS NOTHING AT RUNTIME.
+            // BLOCKING CONTENT BUILDS NOTHING FOR AN AUDIENCE.
             //
             // A placeholder stands in for media that does not exist yet. The
             // authoring tools draw a neutral proxy so the shot can be framed;
@@ -111,8 +127,10 @@ public final class EntityFactory {
             // indistinguishable from a bug and could reach an audience. An
             // entity that isn't built simply never appears, and every action
             // naming it is a no-op — which is the truth about an unfinished
-            // shot.
-            return nil
+            // shot. A TEST SESSION is the one exception: it builds the gray
+            // stand-in, so the Chapter can be tried (OD-143).
+            guard placeholderStandIns == .all else { return nil }
+            entity = PlaceholderStandIn.make(for: definition)
         case .custom:
             if let id = definition.customFactoryId, let make = customFactories[id] {
                 entity = make(definition)

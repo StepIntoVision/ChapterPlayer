@@ -1154,6 +1154,9 @@ public class VideoPlaybackManager {
         case .entity(let name, _, _):
             if let entity = videoEntityRegistry[name] {
                 entity.isEnabled = false
+                // The Screen's gray stand-in, if a test session built one,
+                // is what it shows again once something reveals it.
+                PlaceholderStandIn.setScreenStandIns(visible: true, under: entity)
                 // Drop the VideoPlayerComponent along with the channel. The
                 // channel's AVPlayer is being discarded — a VPC left behind
                 // keeps RealityKit's video-target subscription pointed at
@@ -1434,6 +1437,9 @@ public class VideoPlaybackManager {
                     crop: crop)
                 let material = VideoMaterial(avPlayer: player)
                 entity.components.set(ModelComponent(mesh: mesh, materials: [material]))
+                // A test session's gray stand-in (OD-143) gives way to the
+                // footage, and comes back when it stops.
+                PlaceholderStandIn.setScreenStandIns(visible: false, under: entity)
 
                 // AUTHORED SPATIAL PRESENTATION, and only when it was authored.
                 //
