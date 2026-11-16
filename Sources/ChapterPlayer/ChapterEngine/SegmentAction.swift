@@ -746,3 +746,15 @@ extension SegmentAction {
         }
     }
 }
+
+
+extension SegmentAction {
+    /// OD-149: skipped when a Cue that listens from its Segment's start is
+    /// answered before it fires (a sound or a video not yet started).
+    var startsMedia: Bool {
+        switch self {
+        case .playAudio, .playVideo: return true
+        default: return false
+        }
+    }
+}

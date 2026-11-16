@@ -227,6 +227,9 @@ public struct SegmentGate: Sendable {
     public let radius: Float?
     /// What the story must already remember before this boundary may pass.
     public let storyConditions: StoryConditionGroup?
+    /// OD-149: when this Cue starts listening (from its Segment's start, or
+    /// at its end as before).
+    public let listen: CueListening
 
     public init(
         type: GateType,
@@ -234,8 +237,10 @@ public struct SegmentGate: Sendable {
         prompt: String? = nil,
         targetEntity: String? = nil,
         radius: Float? = nil,
-        storyConditions: StoryConditionGroup? = nil
+        storyConditions: StoryConditionGroup? = nil,
+        listen: CueListening = .atEnd
     ) {
+        self.listen = listen
         self.type = type
         self.timeout = timeout
         self.prompt = prompt
@@ -253,7 +258,7 @@ public struct SegmentGate: Sendable {
     public var authored: SegmentGateDTO {
         SegmentGateDTO(type: type.authored, timeout: timeout, prompt: prompt,
                     targetEntity: targetEntity, radius: radius,
-                    storyConditions: storyConditions)
+                    storyConditions: storyConditions, listen: listen)
     }
 }
 

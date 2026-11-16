@@ -127,6 +127,12 @@ public final class SequenceEngine {
 
     public private(set) var isWaiting: Bool = false
     public private(set) var currentGate: SegmentGate?
+    /// OD-149: the Cue at this Segment's end already listens (it listens from
+    /// the Segment's start) while the Segment still plays. `currentGate` is
+    /// that Cue; `isWaiting` stays false, so the clock is not held.
+    public private(set) var isListeningEarly = false
+    /// The early Cue was answered: the Segment ends now.
+    private var earlyAnswered = false
     public private(set) var waitStartTime: Date?
 
     /// The media occurrences the current Cue wait froze (OD-87), released
@@ -1088,6 +1094,15 @@ public final class SequenceEngine {
             onSegmentChanged?(segment, index)
             sendStatus()
 
+            // OD-149: A CUE THAT LISTENS FROM THE SEGMENT'S START arms now.
+            // Not an Explore Area's exit: the Area has its own timing.
+            isListeningEarly = false
+            earlyAnswered = false
+            if let gate = segment.gate, gate.listen == .fromStart,
+               storyRegions?.ownsGateTiming(atBoundary: segmentEnd) != true {
+                armEarlyCue(gate)
+            }
+
             // Scheduled actions fire inline within the timing loop — no fire-and-forget
             // Tasks. On visionOS, MainActor Task scheduling is starved by RealityKit GPU
             // resource prep, so fire-and-forget Tasks for scheduled actions never execute.
@@ -1135,6 +1150,7 @@ public final class SequenceEngine {
             // condition, so nothing changes for a segment with real duration.
             repeat {
                 guard !Task.isCancelled else { return nil }
+                if earlyAnswered { break }
 
                 if isPaused {
                     sendStatus()
@@ -1244,6 +1260,9 @@ public final class SequenceEngine {
                 let scheduled = scheduledInFireOrder[nextScheduled]
                 let drainedIndex = nextScheduled
                 nextScheduled += 1
+                // OD-149: answered early, so a sound or video that had not
+                // started yet does not start now; everything else lands.
+                if earlyAnswered, scheduled.action.startsMedia { continue }
                 logger.info("Scheduled action fired at the boundary of segment \(segment.id) (authored at +\(String(format: "%.2f", scheduled.at))s of \(String(format: "%.2f", segment.duration))s)")
                 currentFiringOffset = min(scheduled.at, segment.duration)
                 let slot = AuthoredSlot(segment: index, slot: segment.actions.count + drainedIndex)
@@ -1270,7 +1289,13 @@ public final class SequenceEngine {
                     pauseContinuation = nil
                 }
 
-                await waitAtGate(gate, atBoundary: segmentEnd)
+                if earlyAnswered {
+                    earlyAnswered = false
+                } else {
+                    let listening = isListeningEarly
+                    isListeningEarly = false
+                    await waitAtGate(gate, atBoundary: segmentEnd, alreadyListening: listening)
+                }
             }
 
             // `clearGate` (a stop, a jump, a seek) also ends the wait above.
@@ -1336,6 +1361,10 @@ public final class SequenceEngine {
     /// that satisfies a gate while the transport is paused also resumes it,
     /// but a gate timeout must never un-pause what the person paused.
     private func satisfyGate(resumingPlayback: Bool) {
+        if !isWaiting, isListeningEarly {
+            answerEarly()
+            return
+        }
         guard isWaiting else { return }
         logger.info("Gate satisfied")
         gateTimeoutTask?.cancel()
@@ -1397,7 +1426,8 @@ public final class SequenceEngine {
     ///
     /// - Parameter boundary: where the gate's Segment ends on the authored
     ///   Sequence clock, which is how an Explore region recognizes ITS exit.
-    private func waitAtGate(_ gate: SegmentGate, atBoundary boundary: TimeInterval) async {
+    private func waitAtGate(_ gate: SegmentGate, atBoundary boundary: TimeInterval,
+                            alreadyListening: Bool = false) async {
         // A GATE ASKS "IS THIS TRUE?", NOT "DID THIS JUST HAPPEN".
         //
         // So a story-condition boundary whose facts ALREADY hold does not stall
@@ -1408,6 +1438,7 @@ public final class SequenceEngine {
         if let store = storyState,
            GateActivation.satisfiedByStory(gate.authored, in: store.ledger) {
             logger.info("[gate] story conditions already hold; the boundary does not stall")
+            if alreadyListening { endEarlyListening() }
             return
         }
 
@@ -1417,6 +1448,7 @@ public final class SequenceEngine {
         // Waiting here asked again for an act the region no longer wanted.
         if storyRegions?.exitAlreadyResolved(atBoundary: boundary) == true {
             logger.info("[explore] the Explore Area's exit already resolved; the boundary does not stall")
+            if alreadyListening { endEarlyListening() }
             return
         }
 
@@ -1430,10 +1462,14 @@ public final class SequenceEngine {
         beginCueWaitMedia()
 
         sendStatus()
-        onGateStarted?(gate)
-        gateDetector?.gateDidStart(gate) { [weak self] in
-            self?.satisfyGate()
+        if !alreadyListening {
+            onGateStarted?(gate)
+            gateDetector?.gateDidStart(gate) { [weak self] in
+                self?.satisfyGate()
+            }
         }
+        // (Listening since the Segment began, OD-149: detection, Prompt and
+        // Choice are already up, and their callback is `satisfyGate`.)
 
         // A STORY REGION OWNS ITS OWN TIMING. Its fallback runs from region
         // ENTRY on the pause-aware clock; a gate timeout would run from HERE,
@@ -1498,7 +1534,44 @@ public final class SequenceEngine {
         if !Task.isCancelled { gateContinuation = nil }
     }
 
+    /// OD-149: start listening for the Segment's Cue now, while it plays.
+    private func armEarlyCue(_ gate: SegmentGate) {
+        earlyAnswered = false
+        isListeningEarly = true
+        currentGate = gate
+        logger.info("Cue listening from the Segment's start: \(gate.type.rawValue)")
+        onGateStarted?(gate)
+        // The one release: early it ends the Segment now (`answerEarly`),
+        // and once the story waits it releases the wait.
+        gateDetector?.gateDidStart(gate) { [weak self] in
+            self?.satisfyGate()
+        }
+        sendStatus()
+    }
+
+    /// OD-149: answered before the Segment ended. The timing loop sees this
+    /// on its next turn and goes straight to the Cue.
+    private func answerEarly() {
+        guard isListeningEarly else { return }
+        logger.info("Cue answered early: the rest of the Segment is skipped")
+        isListeningEarly = false
+        earlyAnswered = true
+        currentGate = nil
+        onGateEnded?()
+        gateDetector?.gateDidEnd()
+        sendStatus()
+    }
+
+    /// An early Cue the boundary did not need after all: take its detection down.
+    private func endEarlyListening() {
+        currentGate = nil
+        onGateEnded?()
+        gateDetector?.gateDidEnd()
+    }
+
     private func clearGate() {
+        isListeningEarly = false
+        earlyAnswered = false
         gateTimeoutTask?.cancel()
         gateTimeoutTask = nil
         exploreTickTask?.cancel()

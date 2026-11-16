@@ -1772,7 +1772,8 @@ open class ChapterPlayerCore {
         // one of its buttons, or an act on an Object an option names, is a
         // pick; any other act does not answer a Choice
         // (`GateActivation.satisfies` refuses it below).
-        if sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate {
+        let cueListens = sequenceEngine.isWaiting || sequenceEngine.isListeningEarly   // OD-149
+        if cueListens, let gate = sequenceEngine.currentGate {
             let authored = authoredGate(for: gate)
             if GateActivation.waitsForChoice(authored) {
                 if let optionId = choices.optionId(forEntityName: entityName) {
@@ -1787,7 +1788,7 @@ open class ChapterPlayerCore {
 
         // THE WAITING CUE HEARS IT FIRST. One act, one Cue: an act that
         // releases the Cue the story is waiting at is spent there.
-        if sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate,
+        if cueListens, let gate = sequenceEngine.currentGate,
            // THE ACT **AND** WHAT THE STORY REMEMBERS. A condition an author
            // added to a gate is a requirement, so "tap the door once you have
            // the key" cannot be opened by the tap alone.
@@ -1897,7 +1898,8 @@ open class ChapterPlayerCore {
     /// Returns true when the pick was taken.
     @discardableResult
     public func pickChoiceOption(_ optionId: String) -> Bool {
-        guard sequenceEngine.isWaiting, let gate = sequenceEngine.currentGate,
+        guard sequenceEngine.isWaiting || sequenceEngine.isListeningEarly,   // OD-149
+              let gate = sequenceEngine.currentGate,
               var wait = choiceWait, !wait.picked else { return false }
         let authored = authoredGate(for: gate)
         let resolution: CueChoiceResolution

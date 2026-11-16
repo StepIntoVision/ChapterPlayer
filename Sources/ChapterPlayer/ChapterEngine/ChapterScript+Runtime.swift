@@ -445,7 +445,8 @@ private extension SegmentGate {
             prompt: dto.prompt,
             targetEntity: dto.targetEntity,
             radius: dto.radius,
-            storyConditions: dto.storyConditions
+            storyConditions: dto.storyConditions,
+            listen: dto.listen
         )
     }
 }
