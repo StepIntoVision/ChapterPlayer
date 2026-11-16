@@ -42,7 +42,7 @@ public enum ExperienceLoaderError: Error, CustomStringConvertible, LocalizedErro
         case .missingDocument(let path):
             return "chapter.json not found at \(path)"
         case .malformedDocument(let reason):
-            return "Malformed experience document: \(reason)"
+            return "This Chapter couldn't be opened. \(reason)"
         case .unreadable(let url, let err):
             return "Could not read experience at \(url.path): \(err.localizedDescription)"
         }
@@ -140,7 +140,9 @@ public struct LocalFolderExperienceProvider: ExperienceProvider {
             let migrated = try Migrator.migrate(data)
             document = try ChapterScriptFormat.makeDecoder().decode(ChapterDocument.self, from: migrated)
         } catch {
-            throw ExperienceLoaderError.malformedDocument(reason: String(describing: error))
+            // In words, never a raw dump: a newer file says so (and that it is not damaged),
+            // a bad value says where (ChapterOpenFailure).
+            throw ExperienceLoaderError.malformedDocument(reason: ChapterOpenFailure.explanation(for: error))
         }
 
         let assetsRoot = root.appending(path: ChapterScriptFormat.assetsFolderName)
@@ -193,7 +195,9 @@ public struct BundledExperienceProvider: ExperienceProvider {
             let doc = try ChapterScriptFormat.makeDecoder().decode(ChapterDocument.self, from: migrated)
             return LoadedExperience(document: doc, mediaResolver: BundleMediaResolver(), rootURL: url.deletingLastPathComponent())
         } catch {
-            throw ExperienceLoaderError.malformedDocument(reason: String(describing: error))
+            // In words, never a raw dump: a newer file says so (and that it is not damaged),
+            // a bad value says where (ChapterOpenFailure).
+            throw ExperienceLoaderError.malformedDocument(reason: ChapterOpenFailure.explanation(for: error))
         }
     }
 }
