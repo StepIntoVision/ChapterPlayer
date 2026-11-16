@@ -356,6 +356,8 @@ public final class SequenceEngine {
         // before anything at t=0 can read the count.
         crossedMemoryActions.removeAll()
         countEntry(of: sequence)
+        // Before anything at t=0 can show an Object Memory holds back.
+        applyMemoryVisibility(freshVisit: true)
 
         // THE HOST LEARNS WHICH SEQUENCE THIS IS BEFORE ANYTHING IS PRESENTED
         // FOR IT. `registerSequenceAnimation` begins the backdrop and caption
@@ -405,6 +407,7 @@ public final class SequenceEngine {
         // A NEW VISIT, exactly as `play` (see there).
         crossedMemoryActions.removeAll()
         countEntry(of: sequence)
+        applyMemoryVisibility(freshVisit: true)
 
         // THE HOST LEARNS WHICH SEQUENCE THIS IS BEFORE ANYTHING IS PRESENTED
         // FOR IT. `registerSequenceAnimation` begins the backdrop and caption
@@ -1369,10 +1372,25 @@ public final class SequenceEngine {
     /// opened by finding the key, and turning it into that would silently make
     /// the tap decorative.
     public func storyStateDidChange() {
+        applyMemoryVisibility(freshVisit: false)
         guard isWaiting, let gate = currentGate, let store = storyState else { return }
         guard GateActivation.satisfiedByStory(gate.authored, in: store.ledger) else { return }
         logger.info("[gate] satisfied by what the story remembers")
         satisfyGate()
+    }
+
+    /// SHOW WHEN MEMORY MATCHES (format 10, OD-145): hand the executor the
+    /// Objects this Sequence's rules hold back given what the story remembers
+    /// now. On entry (`freshVisit`) and after every Memory change.
+    func applyMemoryVisibility(freshVisit: Bool) {
+        guard let sequence = currentSequence else { return }
+        let held: Set<String>
+        if let authored = sequenceDTOProvider?(sequence.id), let store = storyState {
+            held = authored.objectsHeldBackByMemory(in: store.ledger)
+        } else {
+            held = []
+        }
+        entityExecutor?.setHeldBackByMemory(held, freshVisit: freshVisit)
     }
 
     /// Wait at a gate, respecting pause. Returns when gate is satisfied or task cancelled.

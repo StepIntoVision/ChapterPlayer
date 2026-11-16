@@ -49,6 +49,9 @@ public protocol EntityActionExecutorProtocol {
     func clearSegmentMotions()
     func applyActiveMotions(segmentElapsed: TimeInterval, totalElapsed: TimeInterval)
     func setSequenceAnimation(tracks: [EntityAnimationTrack], clock: (@MainActor () -> TimeInterval)?)
+    /// Show When Memory Matches (format 10, OD-145): the Objects Memory holds
+    /// back right now. `freshVisit` is true on a Sequence entry.
+    func setHeldBackByMemory(_ names: Set<String>, freshVisit: Bool)
 }
 
 /// Default no-op so existing conformers outside this package keep compiling;
@@ -59,6 +62,7 @@ public extension EntityActionExecutorProtocol {
     /// Defaults to the old behavior for conformers outside this package, which
     /// never had Motion Actions 2.0 to keep alive in the first place.
     func clearSegmentMotions() { clearAllMotions() }
+    func setHeldBackByMemory(_ names: Set<String>, freshVisit: Bool) {}
 }
 
 // MARK: - Implementation
@@ -68,6 +72,48 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
 
 
     public init() {}
+
+    // MARK: Show When Memory Matches (format 10, OD-145)
+
+    /// THE OBJECTS MEMORY HOLDS BACK in the playing Sequence. Such an Object
+    /// stays disabled whatever the Timeline says; Show, Hide and Reveal still
+    /// run on it and record what the Timeline wants (`timelineWantsShown`),
+    /// so the moment Memory lets it go it appears exactly as the Timeline
+    /// left it — revealed and faded in, or hidden. The engine recomputes the
+    /// set on every Sequence entry and after every Memory change.
+    public private(set) var heldBackByMemory: Set<String> = []
+    private var timelineWantsShown: [String: Bool] = [:]
+
+    public func setHeldBackByMemory(_ names: Set<String>, freshVisit: Bool) {
+        if freshVisit {
+            // A new visit starts from the reset state: nothing is owed.
+            heldBackByMemory = []
+            timelineWantsShown = [:]
+        }
+        let released = heldBackByMemory.subtracting(names)
+        let newlyHeld = names.subtracting(heldBackByMemory)
+        heldBackByMemory = names
+        for name in newlyHeld {
+            guard let entity = entityRegistry[name] else { continue }
+            timelineWantsShown[name] = entity.isEnabled
+            entity.isEnabled = false
+        }
+        for name in released {
+            let wanted = timelineWantsShown.removeValue(forKey: name) ?? false
+            guard wanted, let entity = entityRegistry[name] else { continue }
+            entity.isEnabled = true
+            logger.debug("Memory lets '\(name)' show")
+        }
+    }
+
+    /// After an action enabled or disabled a held-back Object: remember what
+    /// the Timeline wants, and keep it disabled.
+    private func holdIfMemorySays(_ name: String, _ entity: Entity) {
+        guard heldBackByMemory.contains(name) else { return }
+        timelineWantsShown[name] = entity.isEnabled
+        entity.isEnabled = false
+    }
+
     /// Registry of named entities. Populated by ImmersiveView during setup.
     public var entityRegistry: [String: Entity] = [:]
 
@@ -253,6 +299,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             actionOpacities[name] = 1
         }
         triggerParticleBurstIfNeeded(on: entity)
+        holdIfMemorySays(name, entity)
         logger.debug("Show entity: \(name)")
     }
 
@@ -272,6 +319,7 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             return
         }
         entity.isEnabled = false
+        holdIfMemorySays(name, entity)
         logger.debug("Hide entity: \(name)")
     }
 
@@ -458,8 +506,11 @@ public final class EntityActionExecutor: EntityActionExecutorProtocol {
             noteTransformAction(on: action.entity)
         }
 
-        // 4. Enable (still invisible — opacity 0)
+        // 4. Enable (still invisible — opacity 0), unless Memory holds it
+        //    back: then the fade still runs, and the Object appears at its
+        //    revealed opacity the moment Memory lets it go (OD-145).
         entity.isEnabled = true
+        holdIfMemorySays(action.entity, entity)
 
         // 5. Fade in (or cut-in if duration == 0), on the CANONICAL REVEAL
         //    CURVE (`MotionCurveSampling.revealTiming`, OD-52), sampled per
