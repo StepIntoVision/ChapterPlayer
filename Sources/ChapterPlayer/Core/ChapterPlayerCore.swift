@@ -708,6 +708,11 @@ open class ChapterPlayerCore {
             guard let self else { return }
             let authored = self.authoredGate(for: gate)
             self.waitingCueGate = authored
+            // OD-150: the Objects this Cue (and its Choice) waits for can be
+            // tapped and show the system highlight while it listens.
+            var targets = Set([authored.targetEntity].compactMap { $0 })
+            for option in authored.choice?.options ?? [] { if let t = option.targetEntity { targets.insert(t) } }
+            self.interactions.setGateTargets(targets, label: authored.prompt)
             // A CUE THAT CARRIES A CHOICE (OD-8) shows its question and its
             // options instead of a Prompt and a waiting sign, and offers no
             // "Continue": it is answered by a pick (or its timeout).
@@ -733,6 +738,7 @@ open class ChapterPlayerCore {
         }
         gateDetection.onGateResolved = { [weak self] in
             guard let self else { return }
+            self.interactions.setGateTargets([], label: nil)
             if let gate = self.waitingCueGate { self.lastCueAnswered = (gate, Date()) }
             self.waitingCueGate = nil
             self.interactions.clearGateActions()

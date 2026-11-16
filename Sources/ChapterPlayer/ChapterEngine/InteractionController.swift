@@ -321,7 +321,119 @@ public final class InteractionController {
             undecorate(entity, record: record)
         }
         decorated.removeAll()
+        gateTargetNames = []
+        areaTargetNames = []
+        applyCueTargets()
     }
+
+    // MARK: - Objects a Cue or a Choice is waiting for (OD-150)
+
+    /// AN OBJECT THE STORY ASKS YOU TO TAP CAN BE TAPPED, AND SHOWS IT.
+    ///
+    /// Only Objects with Interactions were given a hit shape, an
+    /// `InputTargetComponent` and the system hover effect, so the Objects a Cue
+    /// or a Choice names ("Tap the lantern", a relic to choose, the lighthouse
+    /// that takes you home, a stair) had none on the headset: no system highlight on
+    /// hover and nothing for the tap to land on. The Mac preview
+    /// clicks through its own hit test, which is why it never showed there.
+    ///
+    /// While a Cue listens (waiting, or from its Segment's start, OD-149), its
+    /// Object and its Choice options' Objects get the same affordances an
+    /// Interaction gets, and an Explore Area's exit Object gets them from Area
+    /// entry. Only what this added is removed when they stop listening.
+    private var gateTargetNames: Set<String> = []
+    private var areaTargetNames: Set<String> = []
+    private var cueTargetRecords: [String: CueTargetRecord] = [:]
+
+    private struct CueTargetRecord {
+        var addedCollision: Bool
+        var addedInputTarget: Bool
+        var addedHoverEffect: Bool
+        var addedAccessibility: Bool
+    }
+
+    /// The Objects the listening Cue names (its own, and its Choice options').
+    public func setGateTargets(_ names: Set<String>, label: String?) {
+        cueTargetRetries = 0
+        gateTargetNames = names.filter { !$0.isEmpty }
+        cueTargetLabel = label
+        applyCueTargets()
+    }
+
+    private var cueTargetLabel: String?
+
+    /// TEST SEAM: the Objects currently decorated as Cue targets.
+    public var cueTargetNamesForTesting: Set<String> { Set(cueTargetRecords.keys) }
+
+    private func applyCueTargets() {
+        let wanted = gateTargetNames.union(areaTargetNames)
+        for name in cueTargetRecords.keys where !wanted.contains(name) {
+            guard let record = cueTargetRecords.removeValue(forKey: name),
+                  let entity = entityProvider?(name) else { continue }
+            if record.addedCollision { entity.components.remove(CollisionComponent.self) }
+            if record.addedInputTarget { entity.components.remove(InputTargetComponent.self) }
+            if record.addedHoverEffect { entity.components.remove(HoverEffectComponent.self) }
+            if record.addedAccessibility { entity.components.remove(AccessibilityComponent.self) }
+        }
+        for name in wanted where cueTargetRecords[name] == nil {
+            guard let entity = entityProvider?(name) else { continue }
+            var record = CueTargetRecord(addedCollision: false, addedInputTarget: false,
+                                         addedHoverEffect: false, addedAccessibility: false)
+            if entity.components[CollisionComponent.self] == nil {
+                let bounds = entity.visualBounds(relativeTo: entity)
+                let usable = simd_length(bounds.extents) > 0.001
+                entity.components.set(CollisionComponent(shapes: [
+                    usable ? .generateBox(size: bounds.extents).offsetBy(translation: bounds.center)
+                           : .generateSphere(radius: 0.1)
+                ]))
+                record.addedCollision = true
+            }
+            if entity.components[InputTargetComponent.self] == nil {
+                entity.components.set(InputTargetComponent())
+                record.addedInputTarget = true
+            }
+            if entity.components[HoverEffectComponent.self] == nil,
+               let effect = hoverEffect(for: InteractionFeedbackSpec()) {
+                entity.components.set(effect)
+                record.addedHoverEffect = true
+            }
+            if entity.components[AccessibilityComponent.self] == nil {
+                var accessibility = AccessibilityComponent()
+                accessibility.isAccessibilityElement = true
+                accessibility.label = LocalizedStringResource(stringLiteral: name)
+                if let label = cueTargetLabel, !label.isEmpty {
+                    accessibility.value = LocalizedStringResource(stringLiteral: label)
+                }
+                accessibility.systemActions = [.activate]
+                entity.components.set(accessibility)
+                record.addedAccessibility = true
+            }
+            cueTargetRecords[name] = record
+            // Activation reaches `handleTap` through the scene subscription; a
+            // Sequence with no Interactions never subscribed.
+            if accessibilitySubscriptions.isEmpty, let scene = entity.scene {
+                subscribeAccessibility(in: scene)
+            }
+        }
+        // An Object revealed in the same moment the Cue starts listening may not
+        // be in the scene yet: look again shortly, while it is still wanted.
+        cueTargetRetry?.cancel()
+        cueTargetRetry = nil
+        let missing = wanted.subtracting(cueTargetRecords.keys)
+        if !missing.isEmpty, cueTargetRetries < 40 {
+            cueTargetRetries += 1
+            cueTargetRetry = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                self?.applyCueTargets()
+            }
+        } else if missing.isEmpty {
+            cueTargetRetries = 0
+        }
+    }
+
+    private var cueTargetRetry: Task<Void, Never>?
+    private var cueTargetRetries = 0
 
     // MARK: - Registration
 
@@ -639,9 +751,17 @@ public final class InteractionController {
             return ran
         }
         // Nothing interactive under the pointer. The gate still hears it —
-        // this is the legacy "tap anywhere targetable" path.
-        _ = offerToGate?(resolvedName(of: entity), .tap, false, false)
+        // this is the legacy "tap anywhere targetable" path. It hears the
+        // AUTHORED Object the tap landed in (OD-150): the nearest named node of
+        // a USDZ is a mesh inside it ("Lantern_01"), which no Cue names.
+        _ = offerToGate?(authoredName(of: ancestry) ?? resolvedName(of: entity), .tap, false, false)
         return false
+    }
+
+    /// The nearest ancestor that IS an authored Object (the entity the
+    /// Chapter's registry holds under that name).
+    private func authoredName(of ancestry: [Entity]) -> String? {
+        ancestry.first { !$0.name.isEmpty && entityProvider?($0.name) === $0 }?.name
     }
 
     /// The nearest ancestor carrying an authored name, for gate targeting.
@@ -900,6 +1020,8 @@ public final class InteractionController {
     public func setAreaExitAction(entityName: String, label: String, trigger: InteractionTrigger) {
         let previous = areaExitAction?.entityName
         areaExitAction = (entityName, GateAction(label: label, trigger: trigger))
+        areaTargetNames = [entityName]
+        applyCueTargets()
         if let previous, previous != entityName { refreshAccessibilityActions(for: previous) }
         refreshAccessibilityActions(for: entityName)
     }
@@ -907,6 +1029,8 @@ public final class InteractionController {
     public func clearAreaExitAction() {
         guard let previous = areaExitAction?.entityName else { return }
         areaExitAction = nil
+        areaTargetNames = []
+        applyCueTargets()
         refreshAccessibilityActions(for: previous)
     }
 
